@@ -15,6 +15,7 @@ const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '�
 struct Snapshot {
     sequence: usize,
     commit: String,
+    datetime: String,
     lines: u64,
 }
 
@@ -28,17 +29,25 @@ struct Delta {
 }
 
 impl Snapshot {
-    fn new(sequence: usize, commit: &str, lines: u64) -> Self {
+    fn new(sequence: usize, commit: &str, datetime: &str, lines: u64) -> Self {
         Self {
             sequence,
             commit: commit.to_owned(),
+            datetime: datetime.to_owned(),
             lines,
         }
     }
 
-    fn label(&self) -> String {
+    fn label(&self, date: bool, sequence_width: usize) -> String {
         let short_hash = self.commit.get(..8).unwrap_or(&self.commit);
-        format!("{:06}:{short_hash}", self.sequence)
+        if date {
+            format!(
+                "{}:{:0sequence_width$}:{short_hash}",
+                self.datetime, self.sequence
+            )
+        } else {
+            format!("{:0sequence_width$}:{short_hash}", self.sequence)
+        }
     }
 }
 
@@ -232,12 +241,15 @@ fn sum_grep_counts(output: &[u8]) -> Result<u64, String> {
     })
 }
 
-fn collect_history_with_grep(repo: &Path, commits: &[&str]) -> Result<Vec<Snapshot>, String> {
+fn collect_history_with_grep(
+    repo: &Path,
+    commits: &[(String, String)],
+) -> Result<Vec<Snapshot>, String> {
     commits
         .iter()
         .enumerate()
-        .map(|(index, commit)| {
-            let args = ["grep", "-I", "-c", "^", commit, "--"];
+        .map(|(index, (commit, datetime))| {
+            let args = ["grep", "-I", "-c", "^", commit.as_str(), "--"];
             let output = git(repo, &args)?;
             if !output.status.success() && output.status.code() != Some(1) {
                 return Err(git_failure(&args, &output));
@@ -245,6 +257,7 @@ fn collect_history_with_grep(repo: &Path, commits: &[&str]) -> Result<Vec<Snapsh
             Ok(Snapshot::new(
                 index + 1,
                 commit,
+                datetime,
                 sum_grep_counts(&output.stdout)?,
             ))
         })
@@ -374,15 +387,30 @@ impl Drop for BlobReader {
 }
 
 fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String> {
-    let rev_list_args = ["rev-list", "--reverse", "--first-parent", revision];
+    let rev_list_args = [
+        "log",
+        "--format=%H%x09%cd",
+        "--date=format:%Y-%m-%d %H:%M:%S",
+        "--reverse",
+        "--first-parent",
+        revision,
+    ];
     let rev_list = git(repo, &rev_list_args)?;
     if !rev_list.status.success() {
         return Err(git_failure(&rev_list_args, &rev_list));
     }
     let commit_output = std::str::from_utf8(&rev_list.stdout)
-        .map_err(|error| format!("git rev-list returned non-UTF-8 output: {error}"))?;
-    let commits: Vec<&str> = commit_output.lines().collect();
-    let changes = diff_history(repo, &commits)?;
+        .map_err(|error| format!("git log returned non-UTF-8 output: {error}"))?;
+    let commits: Vec<(String, String)> = commit_output
+        .lines()
+        .map(|line| {
+            line.split_once('\t')
+                .map(|(commit, datetime)| (commit.to_owned(), datetime.to_owned()))
+                .ok_or_else(|| format!("malformed git log output: {line}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let commit_ids: Vec<&str> = commits.iter().map(|(commit, _)| commit.as_str()).collect();
+    let changes = diff_history(repo, &commit_ids)?;
     if uses_versioned_attributes(&changes) || uses_external_attributes(repo, &changes)? {
         return collect_history_with_grep(repo, &commits);
     }
@@ -390,7 +418,7 @@ fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String>
     let mut total = 0_u64;
     let mut history = Vec::with_capacity(commits.len());
 
-    for (index, (commit, changes)) in commits.iter().zip(changes).enumerate() {
+    for (index, ((commit, datetime), changes)) in commits.iter().zip(changes).enumerate() {
         for change in changes {
             if mode_has_blob(&change.old_mode) {
                 let removed = blobs.line_count(&change.old_oid)?;
@@ -405,7 +433,7 @@ fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String>
                 })?;
             }
         }
-        history.push(Snapshot::new(index + 1, commit, total));
+        history.push(Snapshot::new(index + 1, commit, datetime, total));
     }
     blobs.finish()?;
     Ok(history)
@@ -426,21 +454,22 @@ fn render_bar(value: u64, maximum: u64, width: usize) -> String {
     bar
 }
 
-fn render_chart(history: &[Snapshot], width: usize) -> String {
+fn render_chart(history: &[Snapshot], width: usize, date: bool) -> String {
     let maximum = history
         .iter()
         .map(|snapshot| snapshot.lines)
         .max()
         .unwrap_or(0);
+    let sequence_width = history.len().max(1).to_string().len();
     let label_width = history
         .iter()
-        .map(|snapshot| snapshot.label().len())
+        .map(|snapshot| snapshot.label(date, sequence_width).len())
         .max()
         .unwrap_or(15);
     let mut chart = String::from("        0 LoC\n");
 
     for snapshot in history {
-        let label = snapshot.label();
+        let label = snapshot.label(date, sequence_width);
         let bar = render_bar(snapshot.lines, maximum, width);
         let _ = writeln!(
             chart,
@@ -453,29 +482,30 @@ fn render_chart(history: &[Snapshot], width: usize) -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage: repo-lines [REVISION]\n\nPlot the line count along a Git revision's first-parent history.\n\nArguments:\n  REVISION  revision to inspect [default: HEAD]\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n"
+    "Usage: repo-lines [OPTIONS] [REVISION]\n\nPlot the line count along a Git revision's first-parent history.\n\nArguments:\n  REVISION  revision to inspect [default: HEAD]\n\nOptions:\n  --date         Print commit date and time\n  -h, --help     Print help\n  -V, --version  Print version\n"
 }
 
 fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1);
-    let revision = match args.next().as_deref() {
-        None => "HEAD".to_owned(),
-        Some("-h" | "--help") => {
-            print!("{}", usage());
-            return Ok(());
+    let mut date = false;
+    let mut revision = None;
+    for argument in env::args().skip(1) {
+        match argument.as_str() {
+            "--date" => date = true,
+            "-h" | "--help" => {
+                print!("{}", usage());
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("repo-lines {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ if revision.is_none() => revision = Some(argument),
+            extra => return Err(format!("unexpected argument: {extra}\n\n{}", usage())),
         }
-        Some("-V" | "--version") => {
-            println!("repo-lines {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        Some(revision) => revision.to_owned(),
-    };
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument: {extra}\n\n{}", usage()));
     }
 
-    let history = collect_history(Path::new("."), &revision)?;
-    print!("{}", render_chart(&history, BAR_WIDTH));
+    let history = collect_history(Path::new("."), revision.as_deref().unwrap_or("HEAD"))?;
+    print!("{}", render_chart(&history, BAR_WIDTH, date));
     Ok(())
 }
 
@@ -536,17 +566,25 @@ mod tests {
     #[test]
     fn renders_scaled_bars_in_history_order() {
         let history = vec![
-            Snapshot::new(1, "0123456789abcdef", 5),
-            Snapshot::new(2, "fedcba9876543210", 10),
-            Snapshot::new(3, "aabbccddeeff0011", 0),
+            Snapshot::new(1, "0123456789abcdef", "2026-07-15 10:00:00", 5),
+            Snapshot::new(2, "fedcba9876543210", "2026-07-15 11:00:00", 10),
+            Snapshot::new(3, "aabbccddeeff0011", "2026-07-15 12:00:00", 0),
         ];
 
         assert_eq!(
-            render_chart(&history, 10),
+            render_chart(&history, 10, false),
             "        0 LoC\n\
-             000001:01234567  █████ 5\n\
-             000002:fedcba98  ██████████ 10\n\
-             000003:aabbccdd  0\n"
+             1:01234567  █████ 5\n\
+             2:fedcba98  ██████████ 10\n\
+             3:aabbccdd  0\n"
+        );
+
+        assert_eq!(
+            render_chart(&history, 10, true),
+            "        0 LoC\n\
+             2026-07-15 10:00:00:1:01234567  █████ 5\n\
+             2026-07-15 11:00:00:2:fedcba98  ██████████ 10\n\
+             2026-07-15 12:00:00:3:aabbccdd  0\n"
         );
     }
 
@@ -571,7 +609,8 @@ mod tests {
         let snapshots = collect_history(repo.path(), "HEAD").unwrap();
 
         assert_eq!(snapshots.len(), 4);
-        assert_eq!(snapshots[0], Snapshot::new(1, &first, 1));
+        assert_eq!(snapshots[0].sequence, 1);
+        assert_eq!(snapshots[0].commit, first);
         assert_eq!(snapshots[1].lines, 3);
         assert_eq!(snapshots[2].lines, 5);
         assert_eq!(snapshots[3].lines, 2);
