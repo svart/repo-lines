@@ -481,31 +481,65 @@ fn render_chart(history: &[Snapshot], width: usize, date: bool) -> String {
     chart
 }
 
-fn usage() -> &'static str {
-    "Usage: repo-lines [OPTIONS] [REVISION]\n\nPlot the line count along a Git revision's first-parent history.\n\nArguments:\n  REVISION  revision to inspect [default: HEAD]\n\nOptions:\n  --date         Print commit date and time\n  -h, --help     Print help\n  -V, --version  Print version\n"
+#[derive(Debug, PartialEq, Eq)]
+struct Options {
+    date: bool,
+    revision: String,
+    path: String,
 }
 
-fn run() -> Result<(), String> {
-    let mut date = false;
-    let mut revision = None;
-    for argument in env::args().skip(1) {
+fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options, String> {
+    let mut arguments = arguments.into_iter();
+    let mut options = Options {
+        date: false,
+        revision: "HEAD".to_owned(),
+        path: ".".to_owned(),
+    };
+
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--date" => date = true,
-            "-h" | "--help" => {
-                print!("{}", usage());
-                return Ok(());
+            "--date" => options.date = true,
+            "--rev" => {
+                options.revision = arguments
+                    .next()
+                    .ok_or_else(|| "missing value for --rev".to_owned())?;
             }
-            "-V" | "--version" => {
-                println!("repo-lines {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
+            "--path" => {
+                options.path = arguments
+                    .next()
+                    .ok_or_else(|| "missing value for --path".to_owned())?;
             }
-            _ if revision.is_none() => revision = Some(argument),
-            extra => return Err(format!("unexpected argument: {extra}\n\n{}", usage())),
+            _ => return Err(format!("unexpected argument: {argument}")),
         }
     }
 
-    let history = collect_history(Path::new("."), revision.as_deref().unwrap_or("HEAD"))?;
-    print!("{}", render_chart(&history, BAR_WIDTH, date));
+    Ok(options)
+}
+
+fn usage() -> &'static str {
+    "Usage: repo-lines [OPTIONS]\n\nPlot the line count along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>  Revision to inspect [default: HEAD]\n  --path <PATH>     Repository path [default: .]\n  --date            Print commit date and time\n  -h, --help        Print help\n  -V, --version     Print version\n"
+}
+
+fn run() -> Result<(), String> {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        print!("{}", usage());
+        return Ok(());
+    }
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-V" | "--version"))
+    {
+        println!("repo-lines {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let options = parse_options(arguments).map_err(|error| format!("{error}\n\n{}", usage()))?;
+
+    let history = collect_history(Path::new(&options.path), &options.revision)?;
+    print!("{}", render_chart(&history, BAR_WIDTH, options.date));
     Ok(())
 }
 
@@ -525,6 +559,48 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn parses_default_options() {
+        assert_eq!(
+            parse_options(Vec::<String>::new()).unwrap(),
+            Options {
+                date: false,
+                revision: "HEAD".to_owned(),
+                path: ".".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_revision_path_and_date_options() {
+        let arguments = ["--path", "/tmp/project", "--date", "--rev", "main"].map(str::to_owned);
+
+        assert_eq!(
+            parse_options(arguments).unwrap(),
+            Options {
+                date: true,
+                revision: "main".to_owned(),
+                path: "/tmp/project".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_option_values_and_positional_revision() {
+        assert_eq!(
+            parse_options(["--rev".to_owned()]).unwrap_err(),
+            "missing value for --rev"
+        );
+        assert_eq!(
+            parse_options(["--path".to_owned()]).unwrap_err(),
+            "missing value for --path"
+        );
+        assert_eq!(
+            parse_options(["main".to_owned()]).unwrap_err(),
+            "unexpected argument: main"
+        );
+    }
 
     #[test]
     fn counts_text_lines_and_ignores_binary_blobs() {
