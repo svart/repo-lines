@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write as _};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Output, Stdio};
 use std::{
@@ -17,6 +17,13 @@ struct Snapshot {
     commit: String,
     datetime: String,
     lines: u64,
+    non_blank_lines: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LineCount {
+    all: u64,
+    non_blank: u64,
 }
 
 #[derive(Debug)]
@@ -29,12 +36,19 @@ struct Delta {
 }
 
 impl Snapshot {
-    fn new(sequence: usize, commit: &str, datetime: &str, lines: u64) -> Self {
+    fn new(
+        sequence: usize,
+        commit: &str,
+        datetime: &str,
+        lines: u64,
+        non_blank_lines: u64,
+    ) -> Self {
         Self {
             sequence,
             commit: commit.to_owned(),
             datetime: datetime.to_owned(),
             lines,
+            non_blank_lines,
         }
     }
 
@@ -244,47 +258,69 @@ fn sum_grep_counts(output: &[u8]) -> Result<u64, String> {
 fn collect_history_with_grep(
     repo: &Path,
     commits: &[(String, String)],
+    count_non_blank: bool,
 ) -> Result<Vec<Snapshot>, String> {
     commits
         .iter()
         .enumerate()
         .map(|(index, (commit, datetime))| {
-            let args = ["grep", "-I", "-c", "^", commit.as_str(), "--"];
-            let output = git(repo, &args)?;
-            if !output.status.success() && output.status.code() != Some(1) {
-                return Err(git_failure(&args, &output));
-            }
-            Ok(Snapshot::new(
-                index + 1,
-                commit,
-                datetime,
-                sum_grep_counts(&output.stdout)?,
-            ))
+            let all = grep_line_count(repo, commit, "^")?;
+            let non_blank = if count_non_blank {
+                grep_line_count(repo, commit, "[^[:space:]]")?
+            } else {
+                0
+            };
+            Ok(Snapshot::new(index + 1, commit, datetime, all, non_blank))
         })
         .collect()
 }
 
-fn text_line_count(contents: &[u8]) -> u64 {
+fn grep_line_count(repo: &Path, commit: &str, pattern: &str) -> Result<u64, String> {
+    let args = ["grep", "-I", "-c", pattern, commit, "--"];
+    let output = git(repo, &args)?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(git_failure(&args, &output));
+    }
+    sum_grep_counts(&output.stdout)
+}
+
+fn text_line_counts(contents: &[u8], count_non_blank: bool) -> LineCount {
     const BINARY_SNIFF_BYTES: usize = 8_000;
     if contents[..contents.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
-        return 0;
+        return LineCount::default();
     }
     if contents.is_empty() {
-        return 0;
+        return LineCount::default();
     }
-    contents.iter().filter(|byte| **byte == b'\n').count() as u64
-        + u64::from(contents.last() != Some(&b'\n'))
+
+    let mut count = LineCount::default();
+    let mut line_has_content = false;
+    for byte in contents {
+        if *byte == b'\n' {
+            count.all += 1;
+            count.non_blank += u64::from(line_has_content);
+            line_has_content = false;
+        } else if count_non_blank && !byte.is_ascii_whitespace() {
+            line_has_content = true;
+        }
+    }
+    if contents.last() != Some(&b'\n') {
+        count.all += 1;
+        count.non_blank += u64::from(line_has_content);
+    }
+    count
 }
 
 struct BlobReader {
     child: Option<Child>,
     input: Option<BufWriter<ChildStdin>>,
     output: BufReader<ChildStdout>,
-    cache: HashMap<String, u64>,
+    cache: HashMap<String, LineCount>,
+    count_non_blank: bool,
 }
 
 impl BlobReader {
-    fn open(repo: &Path) -> Result<Self, String> {
+    fn open(repo: &Path, count_non_blank: bool) -> Result<Self, String> {
         let mut child = Command::new("git")
             .args(["cat-file", "--batch"])
             .current_dir(repo)
@@ -306,10 +342,11 @@ impl BlobReader {
             input: Some(BufWriter::new(input)),
             output: BufReader::new(output),
             cache: HashMap::new(),
+            count_non_blank,
         })
     }
 
-    fn line_count(&mut self, oid: &str) -> Result<u64, String> {
+    fn line_count(&mut self, oid: &str) -> Result<LineCount, String> {
         if let Some(lines) = self.cache.get(oid) {
             return Ok(*lines);
         }
@@ -351,7 +388,7 @@ impl BlobReader {
             return Err(format!("invalid blob terminator for {oid}"));
         }
 
-        let lines = text_line_count(&contents);
+        let lines = text_line_counts(&contents, self.count_non_blank);
         self.cache.insert(oid.to_owned(), lines);
         Ok(lines)
     }
@@ -386,7 +423,11 @@ impl Drop for BlobReader {
     }
 }
 
-fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String> {
+fn collect_history(
+    repo: &Path,
+    revision: &str,
+    count_non_blank: bool,
+) -> Result<Vec<Snapshot>, String> {
     let rev_list_args = [
         "log",
         "--format=%H%x09%cd",
@@ -412,28 +453,54 @@ fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String>
     let commit_ids: Vec<&str> = commits.iter().map(|(commit, _)| commit.as_str()).collect();
     let changes = diff_history(repo, &commit_ids)?;
     if uses_versioned_attributes(&changes) || uses_external_attributes(repo, &changes)? {
-        return collect_history_with_grep(repo, &commits);
+        return collect_history_with_grep(repo, &commits, count_non_blank);
     }
-    let mut blobs = BlobReader::open(repo)?;
-    let mut total = 0_u64;
+    let mut blobs = BlobReader::open(repo, count_non_blank)?;
+    let mut total = LineCount::default();
     let mut history = Vec::with_capacity(commits.len());
 
     for (index, ((commit, datetime), changes)) in commits.iter().zip(changes).enumerate() {
         for change in changes {
             if mode_has_blob(&change.old_mode) {
                 let removed = blobs.line_count(&change.old_oid)?;
-                total = total.checked_sub(removed).ok_or_else(|| {
+                total.all = total.all.checked_sub(removed.all).ok_or_else(|| {
                     format!("line count underflow while removing {}", change.old_oid)
                 })?;
+                total.non_blank =
+                    total
+                        .non_blank
+                        .checked_sub(removed.non_blank)
+                        .ok_or_else(|| {
+                            format!(
+                                "non-blank line count underflow while removing {}",
+                                change.old_oid
+                            )
+                        })?;
             }
             if mode_has_blob(&change.new_mode) {
                 let added = blobs.line_count(&change.new_oid)?;
-                total = total.checked_add(added).ok_or_else(|| {
+                total.all = total.all.checked_add(added.all).ok_or_else(|| {
                     format!("line count overflow while adding {}", change.new_oid)
                 })?;
+                total.non_blank =
+                    total
+                        .non_blank
+                        .checked_add(added.non_blank)
+                        .ok_or_else(|| {
+                            format!(
+                                "non-blank line count overflow while adding {}",
+                                change.new_oid
+                            )
+                        })?;
             }
         }
-        history.push(Snapshot::new(index + 1, commit, datetime, total));
+        history.push(Snapshot::new(
+            index + 1,
+            commit,
+            datetime,
+            total.all,
+            total.non_blank,
+        ));
     }
     blobs.finish()?;
     Ok(history)
@@ -444,7 +511,7 @@ fn render_bar(value: u64, maximum: u64, width: usize) -> String {
         return String::new();
     }
 
-    let eighths = (u128::from(value) * width as u128 * 8) / u128::from(maximum);
+    let eighths = scaled_eighths(value, maximum, width);
     let full_blocks = (eighths / 8) as usize;
     let fraction = (eighths % 8) as usize;
     let mut bar = "█".repeat(full_blocks);
@@ -454,7 +521,49 @@ fn render_bar(value: u64, maximum: u64, width: usize) -> String {
     bar
 }
 
-fn render_chart(history: &[Snapshot], width: usize, date: bool) -> String {
+fn scaled_eighths(value: u64, maximum: u64, width: usize) -> u128 {
+    if maximum == 0 || width == 0 {
+        return 0;
+    }
+    (u128::from(value) * width as u128 * 8) / u128::from(maximum)
+}
+
+fn render_layered_bar(
+    non_blank: u64,
+    all: u64,
+    maximum: u64,
+    width: usize,
+    colors: bool,
+) -> String {
+    let all_bar = render_bar(all, maximum, width);
+    if !colors || all_bar.is_empty() {
+        return all_bar;
+    }
+
+    let overlay_width = ((scaled_eighths(non_blank, maximum, width) + 4) / 8) as usize;
+    let overlay_width = overlay_width.min(all_bar.chars().count());
+    let grey_overlay: String = all_bar.chars().take(overlay_width).collect();
+    let white_remainder: String = all_bar.chars().skip(overlay_width).collect();
+    let mut layered = String::new();
+    if !grey_overlay.is_empty() {
+        layered.push_str("\x1b[90m");
+        layered.push_str(&grey_overlay);
+    }
+    if !white_remainder.is_empty() {
+        layered.push_str("\x1b[97m");
+        layered.push_str(&white_remainder);
+    }
+    layered.push_str("\x1b[0m");
+    layered
+}
+
+fn render_chart(
+    history: &[Snapshot],
+    width: usize,
+    date: bool,
+    non_blank: bool,
+    colors: bool,
+) -> String {
     let maximum = history
         .iter()
         .map(|snapshot| snapshot.lines)
@@ -470,7 +579,17 @@ fn render_chart(history: &[Snapshot], width: usize, date: bool) -> String {
 
     for snapshot in history {
         let label = snapshot.label(date, sequence_width);
-        let bar = render_bar(snapshot.lines, maximum, width);
+        let bar = if non_blank {
+            render_layered_bar(
+                snapshot.non_blank_lines,
+                snapshot.lines,
+                maximum,
+                width,
+                colors,
+            )
+        } else {
+            render_bar(snapshot.lines, maximum, width)
+        };
         let _ = writeln!(
             chart,
             "{label:>label_width$}  {bar}{}{}",
@@ -484,6 +603,7 @@ fn render_chart(history: &[Snapshot], width: usize, date: bool) -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     date: bool,
+    non_blank: bool,
     revision: String,
     path: String,
 }
@@ -492,6 +612,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
     let mut arguments = arguments.into_iter();
     let mut options = Options {
         date: false,
+        non_blank: false,
         revision: "HEAD".to_owned(),
         path: ".".to_owned(),
     };
@@ -499,6 +620,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--date" => options.date = true,
+            "--non-blank" => options.non_blank = true,
             "--rev" => {
                 options.revision = arguments
                     .next()
@@ -517,7 +639,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
 }
 
 fn usage() -> &'static str {
-    "Usage: repo-lines [OPTIONS]\n\nPlot the line count along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>  Revision to inspect [default: HEAD]\n  --path <PATH>     Repository path [default: .]\n  --date            Print commit date and time\n  -h, --help        Print help\n  -V, --version     Print version\n"
+    "Usage: repo-lines [OPTIONS]\n\nPlot the line count along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>  Revision to inspect [default: HEAD]\n  --path <PATH>     Repository path [default: .]\n  --date            Print commit date and time\n  --non-blank       Overlay non-blank lines in grey\n  -h, --help        Print help\n  -V, --version     Print version\n"
 }
 
 fn run() -> Result<(), String> {
@@ -538,8 +660,21 @@ fn run() -> Result<(), String> {
     }
     let options = parse_options(arguments).map_err(|error| format!("{error}\n\n{}", usage()))?;
 
-    let history = collect_history(Path::new(&options.path), &options.revision)?;
-    print!("{}", render_chart(&history, BAR_WIDTH, options.date));
+    let history = collect_history(
+        Path::new(&options.path),
+        &options.revision,
+        options.non_blank,
+    )?;
+    print!(
+        "{}",
+        render_chart(
+            &history,
+            BAR_WIDTH,
+            options.date,
+            options.non_blank,
+            std::io::stdout().is_terminal()
+        )
+    );
     Ok(())
 }
 
@@ -566,6 +701,7 @@ mod tests {
             parse_options(Vec::<String>::new()).unwrap(),
             Options {
                 date: false,
+                non_blank: false,
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
             }
@@ -574,12 +710,21 @@ mod tests {
 
     #[test]
     fn parses_revision_path_and_date_options() {
-        let arguments = ["--path", "/tmp/project", "--date", "--rev", "main"].map(str::to_owned);
+        let arguments = [
+            "--path",
+            "/tmp/project",
+            "--date",
+            "--non-blank",
+            "--rev",
+            "main",
+        ]
+        .map(str::to_owned);
 
         assert_eq!(
             parse_options(arguments).unwrap(),
             Options {
                 date: true,
+                non_blank: true,
                 revision: "main".to_owned(),
                 path: "/tmp/project".to_owned(),
             }
@@ -603,11 +748,54 @@ mod tests {
     }
 
     #[test]
-    fn counts_text_lines_and_ignores_binary_blobs() {
-        assert_eq!(text_line_count(b""), 0);
-        assert_eq!(text_line_count(b"one\ntwo\n"), 2);
-        assert_eq!(text_line_count(b"one\ntwo"), 2);
-        assert_eq!(text_line_count(b"binary\0data\n"), 0);
+    fn counts_all_text_lines_and_ignores_binary_blobs() {
+        assert_eq!(text_line_counts(b"", false).all, 0);
+        assert_eq!(text_line_counts(b"one\ntwo\n", false).all, 2);
+        assert_eq!(text_line_counts(b"one\ntwo", false).all, 2);
+        assert_eq!(text_line_counts(b"binary\0data\n", false).all, 0);
+    }
+
+    #[test]
+    fn counts_all_and_non_blank_text_lines_in_one_pass() {
+        assert_eq!(
+            text_line_counts(b"one\n\n  \n\ttwo\nthree", true),
+            LineCount {
+                all: 5,
+                non_blank: 3,
+            }
+        );
+        assert_eq!(
+            text_line_counts(b"binary\0data\n", true),
+            LineCount::default()
+        );
+    }
+
+    #[test]
+    fn skips_non_blank_counting_when_not_requested() {
+        assert_eq!(
+            text_line_counts(b"one\n\nthree\n", false),
+            LineCount {
+                all: 3,
+                non_blank: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn layers_grey_non_blank_lines_over_the_white_total() {
+        assert_eq!(
+            render_layered_bar(5, 10, 10, 10, true),
+            "\x1b[90m█████\x1b[97m█████\x1b[0m"
+        );
+        assert_eq!(render_layered_bar(5, 10, 10, 10, false), "██████████");
+    }
+
+    #[test]
+    fn keeps_fractional_bars_continuous_at_the_color_boundary() {
+        assert_eq!(
+            render_layered_bar(73, 89, 100, 10, true),
+            "\x1b[90m███████\x1b[97m█▉\x1b[0m"
+        );
     }
 
     #[test]
@@ -617,13 +805,14 @@ mod tests {
             ".gitattributes",
             b"*.forced-text diff\n*.forced-binary -diff\n",
         );
-        repo.write("data.forced-text", b"one\0two\n");
+        repo.write("data.forced-text", b"one\0two\n\n  \n");
         repo.write("data.forced-binary", b"one\ntwo\n");
         repo.commit("add attribute overrides");
 
-        let snapshots = collect_history(repo.path(), "HEAD").unwrap();
+        let snapshots = collect_history(repo.path(), "HEAD", true).unwrap();
 
-        assert_eq!(snapshots[0].lines, 3);
+        assert_eq!(snapshots[0].lines, 5);
+        assert_eq!(snapshots[0].non_blank_lines, 3);
     }
 
     #[test]
@@ -634,21 +823,22 @@ mod tests {
         repo.write("data.forced-binary", b"one\ntwo\n");
         repo.commit("add files with local attribute overrides");
 
-        let snapshots = collect_history(repo.path(), "HEAD").unwrap();
+        let snapshots = collect_history(repo.path(), "HEAD", true).unwrap();
 
         assert_eq!(snapshots[0].lines, 1);
+        assert_eq!(snapshots[0].non_blank_lines, 1);
     }
 
     #[test]
     fn renders_scaled_bars_in_history_order() {
         let history = vec![
-            Snapshot::new(1, "0123456789abcdef", "2026-07-15 10:00:00", 5),
-            Snapshot::new(2, "fedcba9876543210", "2026-07-15 11:00:00", 10),
-            Snapshot::new(3, "aabbccddeeff0011", "2026-07-15 12:00:00", 0),
+            Snapshot::new(1, "0123456789abcdef", "2026-07-15 10:00:00", 5, 4),
+            Snapshot::new(2, "fedcba9876543210", "2026-07-15 11:00:00", 10, 8),
+            Snapshot::new(3, "aabbccddeeff0011", "2026-07-15 12:00:00", 0, 0),
         ];
 
         assert_eq!(
-            render_chart(&history, 10, false),
+            render_chart(&history, 10, false, false, false),
             "        0 LoC\n\
              1:01234567  █████ 5\n\
              2:fedcba98  ██████████ 10\n\
@@ -656,12 +846,40 @@ mod tests {
         );
 
         assert_eq!(
-            render_chart(&history, 10, true),
+            render_chart(&history, 10, true, false, false),
             "        0 LoC\n\
              2026-07-15 10:00:00:1:01234567  █████ 5\n\
              2026-07-15 11:00:00:2:fedcba98  ██████████ 10\n\
              2026-07-15 12:00:00:3:aabbccdd  0\n"
         );
+    }
+
+    #[test]
+    fn leaves_the_default_chart_uncolored() {
+        let history = vec![Snapshot::new(
+            1,
+            "0123456789abcdef",
+            "2026-07-15 10:00:00",
+            10,
+            5,
+        )];
+
+        assert_eq!(
+            render_chart(&history, 10, false, false, true),
+            "        0 LoC\n1:01234567  ██████████ 10\n"
+        );
+    }
+
+    #[test]
+    fn collects_non_blank_line_history() {
+        let repo = TempRepo::new();
+        repo.write("tracked.txt", b"one\n\n  \ntwo\n");
+        repo.commit("add blank and non-blank lines");
+
+        let snapshots = collect_history(repo.path(), "HEAD", true).unwrap();
+
+        assert_eq!(snapshots[0].lines, 4);
+        assert_eq!(snapshots[0].non_blank_lines, 2);
     }
 
     #[test]
@@ -682,7 +900,7 @@ mod tests {
         repo.run(&["rm", "tracked.txt"]);
         repo.commit("delete tracked file");
 
-        let snapshots = collect_history(repo.path(), "HEAD").unwrap();
+        let snapshots = collect_history(repo.path(), "HEAD", false).unwrap();
 
         assert_eq!(snapshots.len(), 4);
         assert_eq!(snapshots[0].sequence, 1);

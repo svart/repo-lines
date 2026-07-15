@@ -45,6 +45,7 @@ repo-lines
 repo-lines --rev main
 repo-lines --path ../another-repository
 repo-lines --path ../another-repository --rev v1.0.0 --date
+repo-lines --non-blank
 ```
 
 Options:
@@ -52,6 +53,7 @@ Options:
 - `--rev <REVISION>` selects the revision to inspect
 - `--path <PATH>` selects the Git repository to analyze
 - `--date` prints the commit date and time before the commit number
+- `--non-blank` overlays non-blank lines in grey on the white total-lines bar
 - `-h`, `--help` prints help
 - `-V`, `--version` prints the version
 
@@ -62,6 +64,10 @@ newest. It updates the line total from each commit's changed blobs, avoiding a
 full recount when possible. Repositories with relevant Git attribute rules are
 counted commit by commit so historical text and binary overrides remain
 accurate.
+
+Non-blank lines are counted only when `--non-blank` is selected. When output is
+a terminal, the chart draws the total in white and overlays the non-blank
+portion in grey; redirected output remains uncolored.
 
 Only the first-parent path is plotted, so commits reachable exclusively through
 a merge's other parents do not appear as separate points.
