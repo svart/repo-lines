@@ -1,7 +1,12 @@
 use std::env;
 use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write as _};
 use std::path::Path;
-use std::process::{Command, ExitCode, Output};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Output, Stdio};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+};
 
 const BAR_WIDTH: usize = 50;
 const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
@@ -11,6 +16,15 @@ struct Snapshot {
     sequence: usize,
     commit: String,
     lines: u64,
+}
+
+#[derive(Debug)]
+struct Delta {
+    old_mode: String,
+    new_mode: String,
+    old_oid: String,
+    new_oid: String,
+    path: Vec<u8>,
 }
 
 impl Snapshot {
@@ -46,10 +60,165 @@ fn git_failure(args: &[&str], output: &Output) -> String {
     }
 }
 
+fn git_with_input(repo: &Path, args: &[&str], input: Vec<u8>) -> Result<Output, String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "could not open git stdin".to_owned())?;
+    let writer = thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for git: {error}"))?;
+    writer
+        .join()
+        .map_err(|_| "git input writer panicked".to_owned())?
+        .map_err(|error| format!("could not write to git: {error}"))?;
+    Ok(output)
+}
+
+fn diff_history(repo: &Path, commits: &[&str]) -> Result<Vec<Vec<Delta>>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut input = Vec::new();
+    writeln!(input, "{}", commits[0]).map_err(|error| error.to_string())?;
+    for pair in commits.windows(2) {
+        writeln!(input, "{} {}", pair[1], pair[0]).map_err(|error| error.to_string())?;
+    }
+
+    let args = [
+        "diff-tree",
+        "--stdin",
+        "--root",
+        "-r",
+        "--raw",
+        "-z",
+        "--no-renames",
+        "--no-abbrev",
+    ];
+    let output = git_with_input(repo, &args, input)?;
+    if !output.status.success() {
+        return Err(git_failure(&args, &output));
+    }
+    parse_diff_history(&output.stdout, commits)
+}
+
+fn parse_diff_history(output: &[u8], commits: &[&str]) -> Result<Vec<Vec<Delta>>, String> {
+    let mut tokens: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    if tokens.last() == Some(&&[][..]) {
+        tokens.pop();
+    }
+    let mut cursor = 0;
+    let mut history = Vec::with_capacity(commits.len());
+
+    for commit in commits {
+        let expected_header = *commit;
+        let header = tokens
+            .get(cursor)
+            .ok_or_else(|| format!("missing diff-tree header for {commit}"))?;
+        if *header != expected_header.as_bytes() {
+            return Err(format!(
+                "unexpected diff-tree header: {}",
+                String::from_utf8_lossy(header)
+            ));
+        }
+        cursor += 1;
+
+        let mut changes = Vec::new();
+        while tokens
+            .get(cursor)
+            .is_some_and(|token| token.starts_with(b":"))
+        {
+            let metadata = std::str::from_utf8(&tokens[cursor][1..])
+                .map_err(|error| format!("non-UTF-8 diff-tree metadata: {error}"))?;
+            let mut fields = metadata.split_ascii_whitespace();
+            let old_mode = fields.next();
+            let new_mode = fields.next();
+            let old_oid = fields.next();
+            let new_oid = fields.next();
+            let status = fields.next();
+            if fields.next().is_some()
+                || old_mode.is_none()
+                || new_mode.is_none()
+                || old_oid.is_none()
+                || new_oid.is_none()
+                || status.is_none()
+            {
+                return Err(format!("malformed diff-tree metadata: {metadata}"));
+            }
+            if status.is_some_and(|value| value.len() != 1) {
+                return Err(format!("unexpected diff-tree status: {metadata}"));
+            }
+            if tokens.get(cursor + 1).is_none() {
+                return Err("missing path after diff-tree metadata".to_owned());
+            }
+            changes.push(Delta {
+                old_mode: old_mode.unwrap().to_owned(),
+                new_mode: new_mode.unwrap().to_owned(),
+                old_oid: old_oid.unwrap().to_owned(),
+                new_oid: new_oid.unwrap().to_owned(),
+                path: tokens[cursor + 1].to_owned(),
+            });
+            cursor += 2;
+        }
+        history.push(changes);
+    }
+
+    if cursor != tokens.len() {
+        return Err("unexpected trailing diff-tree output".to_owned());
+    }
+    Ok(history)
+}
+
+fn mode_has_blob(mode: &str) -> bool {
+    mode.starts_with("100") || mode == "120000"
+}
+
+fn uses_versioned_attributes(history: &[Vec<Delta>]) -> bool {
+    history.iter().flatten().any(|change| {
+        change.path.rsplit(|byte| *byte == b'/').next() == Some(b".gitattributes".as_slice())
+    })
+}
+
+fn uses_external_attributes(repo: &Path, history: &[Vec<Delta>]) -> Result<bool, String> {
+    let mut paths = HashSet::new();
+    let mut input = Vec::new();
+    for change in history.iter().flatten() {
+        if paths.insert(change.path.as_slice()) {
+            input.extend_from_slice(&change.path);
+            input.push(0);
+        }
+    }
+    let args = ["check-attr", "-z", "--stdin", "diff"];
+    let output = git_with_input(repo, &args, input)?;
+    if !output.status.success() {
+        return Err(git_failure(&args, &output));
+    }
+    let fields: Vec<&[u8]> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect();
+    if !fields.len().is_multiple_of(3) {
+        return Err("malformed git check-attr output".to_owned());
+    }
+    Ok(fields
+        .chunks_exact(3)
+        .any(|record| record[1] != b"diff" || record[2] != b"unspecified"))
+}
+
 fn sum_grep_counts(output: &[u8]) -> Result<u64, String> {
     let output = std::str::from_utf8(output)
         .map_err(|error| format!("git grep returned non-UTF-8 output: {error}"))?;
-
     output.lines().try_fold(0_u64, |sum, line| {
         let count = line
             .rsplit_once(':')
@@ -63,29 +232,183 @@ fn sum_grep_counts(output: &[u8]) -> Result<u64, String> {
     })
 }
 
+fn collect_history_with_grep(repo: &Path, commits: &[&str]) -> Result<Vec<Snapshot>, String> {
+    commits
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| {
+            let args = ["grep", "-I", "-c", "^", commit, "--"];
+            let output = git(repo, &args)?;
+            if !output.status.success() && output.status.code() != Some(1) {
+                return Err(git_failure(&args, &output));
+            }
+            Ok(Snapshot::new(
+                index + 1,
+                commit,
+                sum_grep_counts(&output.stdout)?,
+            ))
+        })
+        .collect()
+}
+
+fn text_line_count(contents: &[u8]) -> u64 {
+    const BINARY_SNIFF_BYTES: usize = 8_000;
+    if contents[..contents.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return 0;
+    }
+    if contents.is_empty() {
+        return 0;
+    }
+    contents.iter().filter(|byte| **byte == b'\n').count() as u64
+        + u64::from(contents.last() != Some(&b'\n'))
+}
+
+struct BlobReader {
+    child: Option<Child>,
+    input: Option<BufWriter<ChildStdin>>,
+    output: BufReader<ChildStdout>,
+    cache: HashMap<String, u64>,
+}
+
+impl BlobReader {
+    fn open(repo: &Path) -> Result<Self, String> {
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not run git cat-file: {error}"))?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| "could not open git cat-file stdin".to_owned())?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| "could not open git cat-file stdout".to_owned())?;
+        Ok(Self {
+            child: Some(child),
+            input: Some(BufWriter::new(input)),
+            output: BufReader::new(output),
+            cache: HashMap::new(),
+        })
+    }
+
+    fn line_count(&mut self, oid: &str) -> Result<u64, String> {
+        if let Some(lines) = self.cache.get(oid) {
+            return Ok(*lines);
+        }
+
+        let input = self
+            .input
+            .as_mut()
+            .ok_or_else(|| "git cat-file input is closed".to_owned())?;
+        writeln!(input, "{oid}").map_err(|error| format!("could not query blob: {error}"))?;
+        input
+            .flush()
+            .map_err(|error| format!("could not query blob: {error}"))?;
+
+        let mut header = String::new();
+        self.output
+            .read_line(&mut header)
+            .map_err(|error| format!("could not read blob header: {error}"))?;
+        let mut fields = header.split_ascii_whitespace();
+        let returned_oid = fields.next().unwrap_or_default();
+        let object_type = fields.next().unwrap_or_default();
+        let size = fields
+            .next()
+            .ok_or_else(|| format!("malformed cat-file header: {header:?}"))?
+            .parse::<usize>()
+            .map_err(|_| format!("invalid blob size in cat-file header: {header:?}"))?;
+        if returned_oid != oid || object_type != "blob" || fields.next().is_some() {
+            return Err(format!("unexpected cat-file header: {header:?}"));
+        }
+
+        let mut contents = vec![0; size];
+        self.output
+            .read_exact(&mut contents)
+            .map_err(|error| format!("could not read blob {oid}: {error}"))?;
+        let mut terminator = [0];
+        self.output
+            .read_exact(&mut terminator)
+            .map_err(|error| format!("could not read blob terminator: {error}"))?;
+        if terminator[0] != b'\n' {
+            return Err(format!("invalid blob terminator for {oid}"));
+        }
+
+        let lines = text_line_count(&contents);
+        self.cache.insert(oid.to_owned(), lines);
+        Ok(lines)
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.input.take();
+        let mut child = self.child.take().expect("child is present until finish");
+        let status = child
+            .wait()
+            .map_err(|error| format!("could not wait for git cat-file: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        let mut detail = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut detail);
+        }
+        Err(if detail.trim().is_empty() {
+            format!("git cat-file failed with {status}")
+        } else {
+            format!("git cat-file failed: {}", detail.trim())
+        })
+    }
+}
+
+impl Drop for BlobReader {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn collect_history(repo: &Path, revision: &str) -> Result<Vec<Snapshot>, String> {
     let rev_list_args = ["rev-list", "--reverse", "--first-parent", revision];
     let rev_list = git(repo, &rev_list_args)?;
     if !rev_list.status.success() {
         return Err(git_failure(&rev_list_args, &rev_list));
     }
-    let commits = std::str::from_utf8(&rev_list.stdout)
+    let commit_output = std::str::from_utf8(&rev_list.stdout)
         .map_err(|error| format!("git rev-list returned non-UTF-8 output: {error}"))?;
+    let commits: Vec<&str> = commit_output.lines().collect();
+    let changes = diff_history(repo, &commits)?;
+    if uses_versioned_attributes(&changes) || uses_external_attributes(repo, &changes)? {
+        return collect_history_with_grep(repo, &commits);
+    }
+    let mut blobs = BlobReader::open(repo)?;
+    let mut total = 0_u64;
+    let mut history = Vec::with_capacity(commits.len());
 
-    commits
-        .lines()
-        .enumerate()
-        .map(|(index, commit)| {
-            let grep_args = ["grep", "-I", "-c", "^", commit, "--"];
-            let grep = git(repo, &grep_args)?;
-            // Like grep(1), git grep exits 1 when there are no matches.
-            if !grep.status.success() && grep.status.code() != Some(1) {
-                return Err(git_failure(&grep_args, &grep));
+    for (index, (commit, changes)) in commits.iter().zip(changes).enumerate() {
+        for change in changes {
+            if mode_has_blob(&change.old_mode) {
+                let removed = blobs.line_count(&change.old_oid)?;
+                total = total.checked_sub(removed).ok_or_else(|| {
+                    format!("line count underflow while removing {}", change.old_oid)
+                })?;
             }
-            let lines = sum_grep_counts(&grep.stdout)?;
-            Ok(Snapshot::new(index + 1, commit, lines))
-        })
-        .collect()
+            if mode_has_blob(&change.new_mode) {
+                let added = blobs.line_count(&change.new_oid)?;
+                total = total.checked_add(added).ok_or_else(|| {
+                    format!("line count overflow while adding {}", change.new_oid)
+                })?;
+            }
+        }
+        history.push(Snapshot::new(index + 1, commit, total));
+    }
+    blobs.finish()?;
+    Ok(history)
 }
 
 fn render_bar(value: u64, maximum: u64, width: usize) -> String {
@@ -174,17 +497,40 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn parses_git_grep_counts_from_the_last_colon() {
-        let output = b"src/main.rs:12\nnotes:with:colons.txt:7\n";
-
-        assert_eq!(sum_grep_counts(output).unwrap(), 19);
+    fn counts_text_lines_and_ignores_binary_blobs() {
+        assert_eq!(text_line_count(b""), 0);
+        assert_eq!(text_line_count(b"one\ntwo\n"), 2);
+        assert_eq!(text_line_count(b"one\ntwo"), 2);
+        assert_eq!(text_line_count(b"binary\0data\n"), 0);
     }
 
     #[test]
-    fn rejects_malformed_git_grep_output() {
-        let error = sum_grep_counts(b"src/main.rs:not-a-number\n").unwrap_err();
+    fn honors_historical_gitattributes_binary_overrides() {
+        let repo = TempRepo::new();
+        repo.write(
+            ".gitattributes",
+            b"*.forced-text diff\n*.forced-binary -diff\n",
+        );
+        repo.write("data.forced-text", b"one\0two\n");
+        repo.write("data.forced-binary", b"one\ntwo\n");
+        repo.commit("add attribute overrides");
 
-        assert!(error.contains("not-a-number"));
+        let snapshots = collect_history(repo.path(), "HEAD").unwrap();
+
+        assert_eq!(snapshots[0].lines, 3);
+    }
+
+    #[test]
+    fn honors_repository_local_attribute_overrides() {
+        let repo = TempRepo::new();
+        repo.write_git_info_attributes(b"*.forced-text diff\n*.forced-binary -diff\n");
+        repo.write("data.forced-text", b"one\0two\n");
+        repo.write("data.forced-binary", b"one\ntwo\n");
+        repo.commit("add files with local attribute overrides");
+
+        let snapshots = collect_history(repo.path(), "HEAD").unwrap();
+
+        assert_eq!(snapshots[0].lines, 1);
     }
 
     #[test]
@@ -208,6 +554,7 @@ mod tests {
     fn collects_oldest_first_snapshots_from_first_parent_only() {
         let repo = TempRepo::new();
         repo.write("tracked.txt", b"one\n");
+        repo.write("ignored.bin", b"binary\0data\n");
         repo.commit("initial");
         let first = repo.head();
 
@@ -218,13 +565,16 @@ mod tests {
         repo.write("tracked.txt", b"one\ntwo\nthree\n");
         repo.commit("main");
         repo.run(&["merge", "--no-ff", "side", "-m", "merge side"]);
+        repo.run(&["rm", "tracked.txt"]);
+        repo.commit("delete tracked file");
 
         let snapshots = collect_history(repo.path(), "HEAD").unwrap();
 
-        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots.len(), 4);
         assert_eq!(snapshots[0], Snapshot::new(1, &first, 1));
         assert_eq!(snapshots[1].lines, 3);
         assert_eq!(snapshots[2].lines, 5);
+        assert_eq!(snapshots[3].lines, 2);
     }
 
     struct TempRepo {
@@ -251,6 +601,10 @@ mod tests {
 
         fn write(&self, name: &str, contents: &[u8]) {
             fs::write(self.path.join(name), contents).unwrap();
+        }
+
+        fn write_git_info_attributes(&self, contents: &[u8]) {
+            fs::write(self.path.join(".git/info/attributes"), contents).unwrap();
         }
 
         fn commit(&self, message: &str) {
