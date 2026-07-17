@@ -46,6 +46,7 @@ repo-lines --rev main
 repo-lines --path ../another-repository
 repo-lines --path ../another-repository --rev v1.0.0 --date
 repo-lines --non-blank
+repo-lines --commits weekly
 ```
 
 Options:
@@ -54,6 +55,10 @@ Options:
 - `--path <PATH>` selects the Git repository to analyze
 - `--date` prints the commit date and time before the commit number
 - `--non-blank` overlays non-blank lines in grey on the white total-lines bar
+- `--commits <daily|weekly|monthly|yearly>` shows first-parent commit counts per
+  calendar interval instead of line history. Empty intervals between activity
+  are included as zero-height bars; this mode cannot be combined with `--date`
+  or `--non-blank`.
 - `-h`, `--help` prints help
 - `-V`, `--version` prints the version
 

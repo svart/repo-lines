@@ -1,5 +1,4 @@
 use std::env;
-use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Output, Stdio};
@@ -8,11 +7,23 @@ use std::{
     thread,
 };
 
-const BAR_WIDTH: usize = 50;
-const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+mod chart;
+mod cli;
+mod commit_frequency;
 
+#[cfg(test)]
+use chart::render_layered_bar;
+use chart::{render_chart, render_commit_chart};
+#[cfg(test)]
+use cli::CommitInterval;
+#[cfg(test)]
+use cli::Options;
+use cli::{parse_options, usage};
+use commit_frequency::collect_commit_counts;
+
+const BAR_WIDTH: usize = 50;
 #[derive(Debug, PartialEq, Eq)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     sequence: usize,
     commit: String,
     datetime: String,
@@ -36,7 +47,7 @@ struct Delta {
 }
 
 impl Snapshot {
-    fn new(
+    pub(crate) fn new(
         sequence: usize,
         commit: &str,
         datetime: &str,
@@ -52,7 +63,7 @@ impl Snapshot {
         }
     }
 
-    fn label(&self, date: bool, sequence_width: usize) -> String {
+    pub(crate) fn label(&self, date: bool, sequence_width: usize) -> String {
         let short_hash = self.commit.get(..8).unwrap_or(&self.commit);
         if date {
             format!(
@@ -65,7 +76,7 @@ impl Snapshot {
     }
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<Output, String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -73,7 +84,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<Output, String> {
         .map_err(|error| format!("could not run git: {error}"))
 }
 
-fn git_failure(args: &[&str], output: &Output) -> String {
+pub(crate) fn git_failure(args: &[&str], output: &Output) -> String {
     let detail = String::from_utf8_lossy(&output.stderr);
     let detail = detail.trim();
     if detail.is_empty() {
@@ -506,142 +517,6 @@ fn collect_history(
     Ok(history)
 }
 
-fn render_bar(value: u64, maximum: u64, width: usize) -> String {
-    if value == 0 || maximum == 0 || width == 0 {
-        return String::new();
-    }
-
-    let eighths = scaled_eighths(value, maximum, width);
-    let full_blocks = (eighths / 8) as usize;
-    let fraction = (eighths % 8) as usize;
-    let mut bar = "█".repeat(full_blocks);
-    if fraction != 0 {
-        bar.push(FRACTIONAL_BLOCKS[fraction]);
-    }
-    bar
-}
-
-fn scaled_eighths(value: u64, maximum: u64, width: usize) -> u128 {
-    if maximum == 0 || width == 0 {
-        return 0;
-    }
-    (u128::from(value) * width as u128 * 8) / u128::from(maximum)
-}
-
-fn render_layered_bar(
-    non_blank: u64,
-    all: u64,
-    maximum: u64,
-    width: usize,
-    colors: bool,
-) -> String {
-    let all_bar = render_bar(all, maximum, width);
-    if !colors || all_bar.is_empty() {
-        return all_bar;
-    }
-
-    let overlay_width = ((scaled_eighths(non_blank, maximum, width) + 4) / 8) as usize;
-    let overlay_width = overlay_width.min(all_bar.chars().count());
-    let grey_overlay: String = all_bar.chars().take(overlay_width).collect();
-    let white_remainder: String = all_bar.chars().skip(overlay_width).collect();
-    let mut layered = String::new();
-    if !grey_overlay.is_empty() {
-        layered.push_str("\x1b[90m");
-        layered.push_str(&grey_overlay);
-    }
-    if !white_remainder.is_empty() {
-        layered.push_str("\x1b[97m");
-        layered.push_str(&white_remainder);
-    }
-    layered.push_str("\x1b[0m");
-    layered
-}
-
-fn render_chart(
-    history: &[Snapshot],
-    width: usize,
-    date: bool,
-    non_blank: bool,
-    colors: bool,
-) -> String {
-    let maximum = history
-        .iter()
-        .map(|snapshot| snapshot.lines)
-        .max()
-        .unwrap_or(0);
-    let sequence_width = history.len().max(1).to_string().len();
-    let label_width = history
-        .iter()
-        .map(|snapshot| snapshot.label(date, sequence_width).len())
-        .max()
-        .unwrap_or(15);
-    let mut chart = String::from("        0 LoC\n");
-
-    for snapshot in history {
-        let label = snapshot.label(date, sequence_width);
-        let bar = if non_blank {
-            render_layered_bar(
-                snapshot.non_blank_lines,
-                snapshot.lines,
-                maximum,
-                width,
-                colors,
-            )
-        } else {
-            render_bar(snapshot.lines, maximum, width)
-        };
-        let _ = writeln!(
-            chart,
-            "{label:>label_width$}  {bar}{}{}",
-            if bar.is_empty() { "" } else { " " },
-            snapshot.lines
-        );
-    }
-    chart
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Options {
-    date: bool,
-    non_blank: bool,
-    revision: String,
-    path: String,
-}
-
-fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options, String> {
-    let mut arguments = arguments.into_iter();
-    let mut options = Options {
-        date: false,
-        non_blank: false,
-        revision: "HEAD".to_owned(),
-        path: ".".to_owned(),
-    };
-
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--date" => options.date = true,
-            "--non-blank" => options.non_blank = true,
-            "--rev" => {
-                options.revision = arguments
-                    .next()
-                    .ok_or_else(|| "missing value for --rev".to_owned())?;
-            }
-            "--path" => {
-                options.path = arguments
-                    .next()
-                    .ok_or_else(|| "missing value for --path".to_owned())?;
-            }
-            _ => return Err(format!("unexpected argument: {argument}")),
-        }
-    }
-
-    Ok(options)
-}
-
-fn usage() -> &'static str {
-    "Usage: repo-lines [OPTIONS]\n\nPlot the line count along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>  Revision to inspect [default: HEAD]\n  --path <PATH>     Repository path [default: .]\n  --date            Print commit date and time\n  --non-blank       Overlay non-blank lines in grey\n  -h, --help        Print help\n  -V, --version     Print version\n"
-}
-
 fn run() -> Result<(), String> {
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments
@@ -660,21 +535,23 @@ fn run() -> Result<(), String> {
     }
     let options = parse_options(arguments).map_err(|error| format!("{error}\n\n{}", usage()))?;
 
-    let history = collect_history(
-        Path::new(&options.path),
-        &options.revision,
-        options.non_blank,
-    )?;
-    print!(
-        "{}",
-        render_chart(
-            &history,
-            BAR_WIDTH,
-            options.date,
-            options.non_blank,
-            std::io::stdout().is_terminal()
-        )
-    );
+    let repo = Path::new(&options.path);
+    if let Some(interval) = options.commits {
+        let counts = collect_commit_counts(repo, &options.revision, interval)?;
+        print!("{}", render_commit_chart(&counts, interval, BAR_WIDTH));
+    } else {
+        let history = collect_history(repo, &options.revision, options.non_blank)?;
+        print!(
+            "{}",
+            render_chart(
+                &history,
+                BAR_WIDTH,
+                options.date,
+                options.non_blank,
+                std::io::stdout().is_terminal()
+            )
+        );
+    }
     Ok(())
 }
 
@@ -702,6 +579,7 @@ mod tests {
             Options {
                 date: false,
                 non_blank: false,
+                commits: None,
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
             }
@@ -725,9 +603,32 @@ mod tests {
             Options {
                 date: true,
                 non_blank: true,
+                commits: None,
                 revision: "main".to_owned(),
                 path: "/tmp/project".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_commit_interval_and_rejects_incompatible_chart_options() {
+        assert_eq!(
+            parse_options(["--commits", "monthly"].map(str::to_owned)).unwrap(),
+            Options {
+                date: false,
+                non_blank: false,
+                commits: Some(CommitInterval::Monthly),
+                revision: "HEAD".to_owned(),
+                path: ".".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_options(["--commits", "hourly"].map(str::to_owned)).unwrap_err(),
+            "invalid value for --commits: hourly (expected daily, weekly, monthly, or yearly)"
+        );
+        assert_eq!(
+            parse_options(["--commits", "daily", "--date"].map(str::to_owned)).unwrap_err(),
+            "--commits cannot be combined with --date or --non-blank"
         );
     }
 
@@ -744,6 +645,56 @@ mod tests {
         assert_eq!(
             parse_options(["main".to_owned()]).unwrap_err(),
             "unexpected argument: main"
+        );
+    }
+
+    #[test]
+    fn renders_daily_commit_counts_with_empty_days() {
+        let commits = vec![("2026-07-14".to_owned(), 2), ("2026-07-16".to_owned(), 1)];
+
+        assert_eq!(
+            render_commit_chart(&commits, CommitInterval::Daily, 10),
+            "    0 commits\n\
+             2026-07-14  ██████████ 2\n\
+             2026-07-15  0\n\
+             2026-07-16  █████ 1\n"
+        );
+    }
+
+    #[test]
+    fn renders_weekly_monthly_and_yearly_commit_counts() {
+        assert_eq!(
+            render_commit_chart(
+                &[("2026-W01".to_owned(), 1), ("2026-W03".to_owned(), 2)],
+                CommitInterval::Weekly,
+                10,
+            ),
+            "    0 commits\n\
+             2026-W01  █████ 1\n\
+             2026-W02  0\n\
+             2026-W03  ██████████ 2\n"
+        );
+        assert_eq!(
+            render_commit_chart(
+                &[("2025-11".to_owned(), 1), ("2026-01".to_owned(), 2)],
+                CommitInterval::Monthly,
+                10,
+            ),
+            "    0 commits\n\
+             2025-11  █████ 1\n\
+             2025-12  0\n\
+             2026-01  ██████████ 2\n"
+        );
+        assert_eq!(
+            render_commit_chart(
+                &[("2024".to_owned(), 1), ("2026".to_owned(), 2)],
+                CommitInterval::Yearly,
+                10,
+            ),
+            "    0 commits\n\
+             2024  █████ 1\n\
+             2025  0\n\
+             2026  ██████████ 2\n"
         );
     }
 
@@ -910,6 +861,19 @@ mod tests {
         assert_eq!(snapshots[3].lines, 2);
     }
 
+    #[test]
+    fn counts_first_parent_commits_in_calendar_intervals() {
+        let repo = TempRepo::new();
+        repo.commit_at("first", "2026-01-01T12:00:00+0000");
+        repo.commit_at("second", "2026-01-01T13:00:00+0000");
+        repo.commit_at("third", "2026-01-03T12:00:00+0000");
+
+        assert_eq!(
+            collect_commit_counts(repo.path(), "HEAD", CommitInterval::Daily).unwrap(),
+            vec![("2026-01-01".to_owned(), 2), ("2026-01-03".to_owned(), 1)]
+        );
+    }
+
     struct TempRepo {
         path: std::path::PathBuf,
     }
@@ -943,6 +907,21 @@ mod tests {
         fn commit(&self, message: &str) {
             self.run(&["add", "."]);
             self.run(&["commit", "-m", message]);
+        }
+
+        fn commit_at(&self, message: &str, datetime: &str) {
+            let output = Command::new("git")
+                .args(["commit", "--allow-empty", "-m", message])
+                .current_dir(&self.path)
+                .env("GIT_AUTHOR_DATE", datetime)
+                .env("GIT_COMMITTER_DATE", datetime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         fn head(&self) -> String {
