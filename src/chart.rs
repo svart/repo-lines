@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use crate::Snapshot;
 use crate::cli::CommitInterval;
 use crate::language::Language;
-use crate::{LanguageSnapshot, Snapshot};
+use crate::language_history::LanguageSnapshot;
 
 const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 const LANGUAGE_SYMBOLS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
