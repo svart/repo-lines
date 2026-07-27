@@ -11,7 +11,8 @@ first-parent history.
 - The selected interval controls calendar grouping: day, ISO week, month, or year.
 - Intervals without commits between the first and final commits are shown with a zero count.
 - The output uses the existing scaled terminal bars and labels every interval.
-- `--commits` composes with `--path` and `--rev`; `--date` and `--non-blank` are rejected in this mode.
+- `--commits` composes with `--path`, `--rev`, and `--full-width`; `--date` and
+  `--non-blank` are rejected in this mode.
 
 ## Boundaries
 

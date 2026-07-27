@@ -20,5 +20,5 @@ revision's first-parent history.
 
 ## Option compatibility
 
-`--languages` composes with `--path`, `--rev`, and `--date`. It cannot be
-combined with `--commits` or `--non-blank`.
+`--languages` composes with `--path`, `--rev`, `--date`, and `--full-width`. It
+cannot be combined with `--commits` or `--non-blank`.

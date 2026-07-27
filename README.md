@@ -47,6 +47,7 @@ repo-lines --path ../another-repository
 repo-lines --path ../another-repository --rev v1.0.0 --date
 repo-lines --non-blank
 repo-lines --languages
+repo-lines --full-width
 repo-lines --commits weekly
 ```
 
@@ -63,6 +64,9 @@ Options:
   calendar interval instead of line history. Empty intervals between activity
   are included as zero-height bars; this mode cannot be combined with `--date`
   or `--non-blank`.
+- `--full-width` expands the diagram to use the available terminal width. It
+  works with line history, language fractions, and commit-frequency charts. If
+  no terminal size is available, the chart retains its default width.
 - `-h`, `--help` prints help
 - `-V`, `--version` prints the version
 
@@ -83,6 +87,10 @@ the same physical line counts as the default chart, including blank and comment
 lines. Unrecognized files are grouped under `Other`, so every non-empty bar
 represents 100% of the repository's text lines. Terminal output uses colors;
 redirected output uses letters identified by the legend.
+
+By default, bars are at most 50 columns wide. With `--full-width`, `repo-lines`
+reserves space for labels and numeric values and gives the remaining terminal
+columns to the diagram.
 
 Only the first-parent path is plotted, so commits reachable exclusively through
 a merge's other parents do not appear as separate points.
