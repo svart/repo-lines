@@ -10,6 +10,7 @@ use std::{
 mod chart;
 mod cli;
 mod commit_frequency;
+mod language;
 
 #[cfg(test)]
 use chart::render_layered_bar;
