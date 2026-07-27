@@ -1,9 +1,16 @@
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::Snapshot;
 use crate::cli::CommitInterval;
+use crate::language::Language;
+use crate::{LanguageSnapshot, Snapshot};
 
 const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+const LANGUAGE_SYMBOLS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const LANGUAGE_COLORS: [u8; 36] = [
+    39, 208, 70, 135, 220, 45, 203, 33, 112, 214, 171, 81, 196, 118, 207, 44, 178, 69, 141, 215,
+    77, 204, 38, 172, 62, 210, 36, 180, 75, 168, 48, 202, 99, 114, 217, 51,
+];
 
 pub fn render_chart(
     history: &[Snapshot],
@@ -70,6 +77,124 @@ pub fn render_commit_chart(
         );
     }
     chart
+}
+
+pub fn render_language_chart(
+    history: &[LanguageSnapshot],
+    width: usize,
+    date: bool,
+    colors: bool,
+) -> String {
+    let mut languages: Vec<Language> = history
+        .iter()
+        .flat_map(|snapshot| snapshot.lines.keys().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    languages.sort_by_key(|language| (*language == Language::Other, language.name()));
+
+    let sequence_width = history.len().max(1).to_string().len();
+    let label_width = history
+        .iter()
+        .map(|snapshot| snapshot.label(date, sequence_width).len())
+        .max()
+        .unwrap_or(15);
+    let mut chart = format!(
+        "{:>label_width$}  0%{:>marker_width$}\n",
+        "",
+        "100%",
+        marker_width = width.saturating_sub(2)
+    );
+    for snapshot in history {
+        let label = snapshot.label(date, sequence_width);
+        let widths = language_widths(snapshot, &languages, width);
+        if widths.iter().all(|segment| *segment == 0) {
+            let _ = writeln!(chart, "{label:>label_width$}  0 lines");
+            continue;
+        }
+        let bar = render_language_bar(&widths, colors);
+        let _ = writeln!(chart, "{label:>label_width$}  {bar}");
+    }
+
+    if !languages.is_empty() {
+        chart.push('\n');
+        chart.push_str("Legend: ");
+        for (index, language) in languages.iter().enumerate() {
+            if index != 0 {
+                chart.push_str(", ");
+            }
+            if colors {
+                let _ = write!(
+                    chart,
+                    "\x1b[38;5;{}m█\x1b[0m {}",
+                    LANGUAGE_COLORS[index % LANGUAGE_COLORS.len()],
+                    language.name()
+                );
+            } else {
+                let _ = write!(
+                    chart,
+                    "{} {}",
+                    char::from(LANGUAGE_SYMBOLS[index]),
+                    language.name()
+                );
+            }
+        }
+        chart.push('\n');
+    }
+    chart
+}
+
+fn language_widths(
+    snapshot: &LanguageSnapshot,
+    languages: &[Language],
+    width: usize,
+) -> Vec<usize> {
+    let total: u128 = snapshot
+        .lines
+        .values()
+        .map(|value| u128::from(*value))
+        .sum();
+    if total == 0 || width == 0 {
+        return vec![0; languages.len()];
+    }
+
+    let mut widths = Vec::with_capacity(languages.len());
+    let mut remainders = Vec::with_capacity(languages.len());
+    for language in languages {
+        let scaled = u128::from(snapshot.lines.get(language).copied().unwrap_or(0)) * width as u128;
+        widths.push((scaled / total) as usize);
+        remainders.push(scaled % total);
+    }
+    let allocated: usize = widths.iter().sum();
+    let mut order: Vec<usize> = (0..languages.len()).collect();
+    order.sort_by_key(|index| (std::cmp::Reverse(remainders[*index]), *index));
+    for index in order.into_iter().take(width - allocated) {
+        widths[index] += 1;
+    }
+    widths
+}
+
+fn render_language_bar(widths: &[usize], colors: bool) -> String {
+    let mut bar = String::new();
+    for (index, width) in widths.iter().enumerate() {
+        if *width == 0 {
+            continue;
+        }
+        if colors {
+            let _ = write!(
+                bar,
+                "\x1b[38;5;{}m{}\x1b[0m",
+                LANGUAGE_COLORS[index % LANGUAGE_COLORS.len()],
+                "█".repeat(*width)
+            );
+        } else {
+            bar.extend(std::iter::repeat_n(
+                char::from(LANGUAGE_SYMBOLS[index]),
+                *width,
+            ));
+        }
+    }
+    bar
 }
 
 fn render_bar(value: u64, maximum: u64, width: usize) -> String {

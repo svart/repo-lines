@@ -14,7 +14,7 @@ mod language;
 
 #[cfg(test)]
 use chart::render_layered_bar;
-use chart::{render_chart, render_commit_chart};
+use chart::{render_chart, render_commit_chart, render_language_chart};
 #[cfg(test)]
 use cli::CommitInterval;
 #[cfg(test)]
@@ -87,12 +87,7 @@ impl Snapshot {
 }
 
 impl LanguageSnapshot {
-    fn new(
-        sequence: usize,
-        commit: &str,
-        datetime: &str,
-        lines: BTreeMap<Language, u64>,
-    ) -> Self {
+    fn new(sequence: usize, commit: &str, datetime: &str, lines: BTreeMap<Language, u64>) -> Self {
         Self {
             sequence,
             commit: commit.to_owned(),
@@ -101,6 +96,17 @@ impl LanguageSnapshot {
         }
     }
 
+    pub(crate) fn label(&self, date: bool, sequence_width: usize) -> String {
+        let short_hash = self.commit.get(..8).unwrap_or(&self.commit);
+        if date {
+            format!(
+                "{}:{:0sequence_width$}:{short_hash}",
+                self.datetime, self.sequence
+            )
+        } else {
+            format!("{:0sequence_width$}:{short_hash}", self.sequence)
+        }
+    }
 }
 
 pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<Output, String> {
@@ -544,10 +550,7 @@ fn collect_history(
     Ok(history)
 }
 
-fn grep_language_counts(
-    repo: &Path,
-    commit: &str,
-) -> Result<BTreeMap<Language, u64>, String> {
+fn grep_language_counts(repo: &Path, commit: &str) -> Result<BTreeMap<Language, u64>, String> {
     let args = ["grep", "-I", "-c", "-z", "^", commit, "--"];
     let output = git(repo, &args)?;
     if !output.status.success() && output.status.code() != Some(1) {
@@ -604,10 +607,7 @@ fn collect_language_history_with_grep(
         .collect()
 }
 
-fn collect_language_history(
-    repo: &Path,
-    revision: &str,
-) -> Result<Vec<LanguageSnapshot>, String> {
+fn collect_language_history(repo: &Path, revision: &str) -> Result<Vec<LanguageSnapshot>, String> {
     let log_args = [
         "log",
         "--format=%H%x09%cd",
@@ -701,6 +701,17 @@ fn run() -> Result<(), String> {
     if let Some(interval) = options.commits {
         let counts = collect_commit_counts(repo, &options.revision, interval)?;
         print!("{}", render_commit_chart(&counts, interval, BAR_WIDTH));
+    } else if options.languages {
+        let history = collect_language_history(repo, &options.revision)?;
+        print!(
+            "{}",
+            render_language_chart(
+                &history,
+                BAR_WIDTH,
+                options.date,
+                std::io::stdout().is_terminal()
+            )
+        );
     } else {
         let history = collect_history(repo, &options.revision, options.non_blank)?;
         print!(
@@ -991,6 +1002,53 @@ mod tests {
              2026-07-15 11:00:00:2:fedcba98  ██████████ 10\n\
              2026-07-15 12:00:00:3:aabbccdd  0\n"
         );
+    }
+
+    #[test]
+    fn renders_language_fractions_with_stable_plain_text_symbols() {
+        let history = vec![
+            LanguageSnapshot::new(
+                1,
+                "0123456789abcdef",
+                "2026-07-15 10:00:00",
+                BTreeMap::from([(Language::Rust, 3), (Language::Markdown, 1)]),
+            ),
+            LanguageSnapshot::new(
+                2,
+                "fedcba9876543210",
+                "2026-07-15 11:00:00",
+                BTreeMap::from([(Language::Rust, 2), (Language::Python, 2)]),
+            ),
+        ];
+
+        let chart = render_language_chart(&history, 10, false, false);
+
+        assert!(chart.contains("1:01234567  AAACCCCCCC\n"));
+        assert!(chart.contains("2:fedcba98  BBBBBCCCCC\n"));
+        assert!(chart.ends_with("Legend: A Markdown, B Python, C Rust\n"));
+    }
+
+    #[test]
+    fn language_fraction_rounding_always_fills_the_bar() {
+        let history = vec![LanguageSnapshot::new(
+            1,
+            "0123456789abcdef",
+            "2026-07-15 10:00:00",
+            BTreeMap::from([
+                (Language::Rust, 1),
+                (Language::Python, 1),
+                (Language::Markdown, 1),
+            ]),
+        )];
+
+        let chart = render_language_chart(&history, 10, false, false);
+        let bar = chart
+            .lines()
+            .find(|line| line.contains("1:01234567"))
+            .and_then(|line| line.rsplit_once("  ").map(|(_, bar)| bar))
+            .unwrap();
+
+        assert_eq!(bar.chars().count(), 10);
     }
 
     #[test]
