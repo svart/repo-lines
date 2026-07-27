@@ -46,6 +46,7 @@ repo-lines --rev main
 repo-lines --path ../another-repository
 repo-lines --path ../another-repository --rev v1.0.0 --date
 repo-lines --non-blank
+repo-lines --languages
 repo-lines --commits weekly
 ```
 
@@ -55,6 +56,9 @@ Options:
 - `--path <PATH>` selects the Git repository to analyze
 - `--date` prints the commit date and time before the commit number
 - `--non-blank` overlays non-blank lines in grey on the white total-lines bar
+- `--languages` shows the fraction of text lines belonging to each detected
+  language as a normalized stacked bar. It can be combined with `--date`, but
+  not with `--non-blank` or `--commits`.
 - `--commits <daily|weekly|monthly|yearly>` shows first-parent commit counts per
   calendar interval instead of line history. Empty intervals between activity
   are included as zero-height bars; this mode cannot be combined with `--date`
@@ -73,6 +77,12 @@ accurate.
 Non-blank lines are counted only when `--non-blank` is selected. When output is
 a terminal, the chart draws the total in white and overlays the non-blank
 portion in grey; redirected output remains uncolored.
+
+Language charts classify tracked text files by filename or extension. They use
+the same physical line counts as the default chart, including blank and comment
+lines. Unrecognized files are grouped under `Other`, so every non-empty bar
+represents 100% of the repository's text lines. Terminal output uses colors;
+redirected output uses letters identified by the legend.
 
 Only the first-parent path is plotted, so commits reachable exclusively through
 a merge's other parents do not appear as separate points.
