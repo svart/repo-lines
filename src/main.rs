@@ -180,12 +180,21 @@ fn parse_diff_history(output: &[u8], commits: &[&str]) -> Result<Vec<Vec<Delta>>
     let mut cursor = 0;
     let mut history = Vec::with_capacity(commits.len());
 
-    for commit in commits {
+    for (index, commit) in commits.iter().enumerate() {
         let expected_header = *commit;
-        let header = tokens
-            .get(cursor)
-            .ok_or_else(|| format!("missing diff-tree header for {commit}"))?;
+        let Some(header) = tokens.get(cursor) else {
+            history.push(Vec::new());
+            continue;
+        };
         if *header != expected_header.as_bytes() {
+            // diff-tree emits no header or records for an unchanged comparison.
+            if commits[index + 1..]
+                .iter()
+                .any(|future| future.as_bytes() == *header)
+            {
+                history.push(Vec::new());
+                continue;
+            }
             return Err(format!(
                 "unexpected diff-tree header: {}",
                 String::from_utf8_lossy(header)
@@ -860,6 +869,25 @@ mod tests {
                 non_blank: 0,
             }
         );
+    }
+
+    #[test]
+    fn parses_empty_diff_tree_comparisons_without_headers() {
+        let commits = ["first", "empty", "third"];
+        let output = b"first\0\
+            :000000 100644 0000000000000000000000000000000000000000 \
+            1111111111111111111111111111111111111111 A\0first.txt\0\
+            third\0\
+            :100644 100644 1111111111111111111111111111111111111111 \
+            2222222222222222222222222222222222222222 M\0third.txt\0";
+
+        let history = parse_diff_history(output, &commits).unwrap();
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].len(), 1);
+        assert!(history[1].is_empty());
+        assert_eq!(history[2].len(), 1);
+        assert_eq!(history[2][0].path, b"third.txt");
     }
 
     #[test]
