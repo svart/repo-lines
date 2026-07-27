@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     thread,
 };
+use terminal_size::{Width, terminal_size};
 
 mod chart;
 mod cli;
@@ -15,6 +16,9 @@ mod language_history;
 
 #[cfg(test)]
 use chart::render_layered_bar;
+use chart::{
+    commit_chart_reserved_width, language_chart_reserved_width, line_chart_reserved_width,
+};
 use chart::{render_chart, render_commit_chart, render_language_chart};
 #[cfg(test)]
 use cli::CommitInterval;
@@ -558,27 +562,47 @@ fn run() -> Result<(), String> {
     let options = parse_options(arguments).map_err(|error| format!("{error}\n\n{}", usage()))?;
 
     let repo = Path::new(&options.path);
+    let terminal_columns = options
+        .full_width
+        .then(terminal_size)
+        .flatten()
+        .map(|(Width(columns), _)| usize::from(columns));
     if let Some(interval) = options.commits {
         let counts = collect_commit_counts(repo, &options.revision, interval)?;
-        print!("{}", render_commit_chart(&counts, interval, BAR_WIDTH));
+        let width = choose_bar_width(
+            options.full_width,
+            terminal_columns,
+            commit_chart_reserved_width(&counts),
+        );
+        print!("{}", render_commit_chart(&counts, interval, width));
     } else if options.languages {
         let history = collect_language_history(repo, &options.revision)?;
+        let width = choose_bar_width(
+            options.full_width,
+            terminal_columns,
+            language_chart_reserved_width(&history, options.date),
+        );
         print!(
             "{}",
             render_language_chart(
                 &history,
-                BAR_WIDTH,
+                width,
                 options.date,
                 std::io::stdout().is_terminal()
             )
         );
     } else {
         let history = collect_history(repo, &options.revision, options.non_blank)?;
+        let width = choose_bar_width(
+            options.full_width,
+            terminal_columns,
+            line_chart_reserved_width(&history, options.date),
+        );
         print!(
             "{}",
             render_chart(
                 &history,
-                BAR_WIDTH,
+                width,
                 options.date,
                 options.non_blank,
                 std::io::stdout().is_terminal()
@@ -712,6 +736,30 @@ mod tests {
         assert_eq!(choose_bar_width(true, Some(120), 30), 90);
         assert_eq!(choose_bar_width(true, Some(20), 30), 0);
         assert_eq!(choose_bar_width(true, None, 30), BAR_WIDTH);
+    }
+
+    #[test]
+    fn reserves_non_bar_columns_for_each_chart_mode() {
+        let lines = vec![Snapshot::new(
+            1,
+            "0123456789abcdef",
+            "2026-07-15 10:00:00",
+            10,
+            5,
+        )];
+        let languages = vec![LanguageSnapshot::new(
+            1,
+            "0123456789abcdef",
+            "2026-07-15 10:00:00",
+            BTreeMap::from([(Language::Rust, 10)]),
+        )];
+
+        assert_eq!(line_chart_reserved_width(&lines, false), 15);
+        assert_eq!(
+            commit_chart_reserved_width(&[("2026-07-15".to_owned(), 10)]),
+            15
+        );
+        assert_eq!(language_chart_reserved_width(&languages, false), 12);
     }
 
     #[test]

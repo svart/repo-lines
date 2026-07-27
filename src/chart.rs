@@ -26,11 +26,7 @@ pub fn render_chart(
         .max()
         .unwrap_or(0);
     let sequence_width = history.len().max(1).to_string().len();
-    let label_width = history
-        .iter()
-        .map(|snapshot| snapshot.label(date, sequence_width).len())
-        .max()
-        .unwrap_or(15);
+    let label_width = line_chart_label_width(history, date, sequence_width);
     let mut chart = String::from("        0 LoC\n");
     for snapshot in history {
         let label = snapshot.label(date, sequence_width);
@@ -55,6 +51,25 @@ pub fn render_chart(
     chart
 }
 
+pub fn line_chart_reserved_width(history: &[Snapshot], date: bool) -> usize {
+    let sequence_width = history.len().max(1).to_string().len();
+    let label_width = line_chart_label_width(history, date, sequence_width);
+    let value_width = history
+        .iter()
+        .map(|snapshot| snapshot.lines.to_string().len())
+        .max()
+        .unwrap_or(1);
+    label_width + 3 + value_width
+}
+
+fn line_chart_label_width(history: &[Snapshot], date: bool, sequence_width: usize) -> usize {
+    history
+        .iter()
+        .map(|snapshot| snapshot.label(date, sequence_width).len())
+        .max()
+        .unwrap_or(15)
+}
+
 pub fn render_commit_chart(
     counts: &[(String, u64)],
     interval: CommitInterval,
@@ -62,11 +77,7 @@ pub fn render_commit_chart(
 ) -> String {
     let counts = fill_empty_intervals(counts, interval);
     let maximum = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
-    let label_width = counts
-        .iter()
-        .map(|(label, _)| label.len())
-        .max()
-        .unwrap_or(0);
+    let label_width = commit_chart_label_width(&counts);
     let mut chart = String::from("    0 commits\n");
     for (label, count) in counts {
         let bar = render_bar(count, maximum, width);
@@ -78,6 +89,24 @@ pub fn render_commit_chart(
         );
     }
     chart
+}
+
+pub fn commit_chart_reserved_width(counts: &[(String, u64)]) -> usize {
+    let label_width = commit_chart_label_width(counts);
+    let value_width = counts
+        .iter()
+        .map(|(_, count)| count.to_string().len())
+        .max()
+        .unwrap_or(1);
+    label_width + 3 + value_width
+}
+
+fn commit_chart_label_width(counts: &[(String, u64)]) -> usize {
+    counts
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn render_language_chart(
@@ -95,11 +124,7 @@ pub fn render_language_chart(
     languages.sort_by_key(|language| (*language == Language::Other, language.name()));
 
     let sequence_width = history.len().max(1).to_string().len();
-    let label_width = history
-        .iter()
-        .map(|snapshot| snapshot.label(date, sequence_width).len())
-        .max()
-        .unwrap_or(15);
+    let label_width = language_chart_label_width(history, date, sequence_width);
     let mut chart = format!(
         "{:>label_width$}  0%{:>marker_width$}\n",
         "",
@@ -143,6 +168,23 @@ pub fn render_language_chart(
         chart.push('\n');
     }
     chart
+}
+
+pub fn language_chart_reserved_width(history: &[LanguageSnapshot], date: bool) -> usize {
+    let sequence_width = history.len().max(1).to_string().len();
+    language_chart_label_width(history, date, sequence_width) + 2
+}
+
+fn language_chart_label_width(
+    history: &[LanguageSnapshot],
+    date: bool,
+    sequence_width: usize,
+) -> usize {
+    history
+        .iter()
+        .map(|snapshot| snapshot.label(date, sequence_width).len())
+        .max()
+        .unwrap_or(15)
 }
 
 fn language_widths(
