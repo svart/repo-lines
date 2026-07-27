@@ -579,6 +579,7 @@ mod tests {
             Options {
                 date: false,
                 non_blank: false,
+                languages: false,
                 commits: None,
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
@@ -603,6 +604,7 @@ mod tests {
             Options {
                 date: true,
                 non_blank: true,
+                languages: false,
                 commits: None,
                 revision: "main".to_owned(),
                 path: "/tmp/project".to_owned(),
@@ -617,6 +619,7 @@ mod tests {
             Options {
                 date: false,
                 non_blank: false,
+                languages: false,
                 commits: Some(CommitInterval::Monthly),
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
@@ -629,6 +632,29 @@ mod tests {
         assert_eq!(
             parse_options(["--commits", "daily", "--date"].map(str::to_owned)).unwrap_err(),
             "--commits cannot be combined with --date or --non-blank"
+        );
+    }
+
+    #[test]
+    fn parses_language_chart_and_rejects_incompatible_modes() {
+        assert_eq!(
+            parse_options(["--languages", "--date"].map(str::to_owned)).unwrap(),
+            Options {
+                date: true,
+                non_blank: false,
+                languages: true,
+                commits: None,
+                revision: "HEAD".to_owned(),
+                path: ".".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_options(["--languages", "--non-blank"].map(str::to_owned)).unwrap_err(),
+            "--languages cannot be combined with --commits or --non-blank"
+        );
+        assert_eq!(
+            parse_options(["--languages", "--commits", "daily"].map(str::to_owned)).unwrap_err(),
+            "--languages cannot be combined with --commits or --non-blank"
         );
     }
 

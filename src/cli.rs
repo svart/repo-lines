@@ -22,6 +22,7 @@ impl CommitInterval {
 pub struct Options {
     pub date: bool,
     pub non_blank: bool,
+    pub languages: bool,
     pub commits: Option<CommitInterval>,
     pub revision: String,
     pub path: String,
@@ -32,6 +33,7 @@ pub fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Opti
     let mut options = Options {
         date: false,
         non_blank: false,
+        languages: false,
         commits: None,
         revision: "HEAD".to_owned(),
         path: ".".to_owned(),
@@ -41,6 +43,7 @@ pub fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Opti
         match argument.as_str() {
             "--date" => options.date = true,
             "--non-blank" => options.non_blank = true,
+            "--languages" => options.languages = true,
             "--commits" => {
                 let value = arguments
                     .next()
@@ -62,6 +65,9 @@ pub fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Opti
             _ => return Err(format!("unexpected argument: {argument}")),
         }
     }
+    if options.languages && (options.commits.is_some() || options.non_blank) {
+        return Err("--languages cannot be combined with --commits or --non-blank".to_owned());
+    }
     if options.commits.is_some() && (options.date || options.non_blank) {
         return Err("--commits cannot be combined with --date or --non-blank".to_owned());
     }
@@ -69,5 +75,5 @@ pub fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Opti
 }
 
 pub fn usage() -> &'static str {
-    "Usage: repo-lines [OPTIONS]\n\nPlot line count or commit frequency along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>                         Revision to inspect [default: HEAD]\n  --path <PATH>                            Repository path [default: .]\n  --date                                   Print commit date and time\n  --non-blank                              Overlay non-blank lines in grey\n  --commits <daily|weekly|monthly|yearly>  Plot commit frequency instead of lines\n  -h, --help                               Print help\n  -V, --version                            Print version\n"
+    "Usage: repo-lines [OPTIONS]\n\nPlot line count, language fractions, or commit frequency along a Git revision's first-parent history.\n\nOptions:\n  --rev <REVISION>                         Revision to inspect [default: HEAD]\n  --path <PATH>                            Repository path [default: .]\n  --date                                   Print commit date and time\n  --non-blank                              Overlay non-blank lines in grey\n  --languages                              Plot the fraction of lines by language\n  --commits <daily|weekly|monthly|yearly>  Plot commit frequency instead of lines\n  -h, --help                               Print help\n  -V, --version                            Print version\n"
 }
