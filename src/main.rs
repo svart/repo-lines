@@ -29,6 +29,21 @@ use language_history::LanguageSnapshot;
 use language_history::collect_language_history;
 
 const BAR_WIDTH: usize = 50;
+
+fn choose_bar_width(
+    full_width: bool,
+    terminal_columns: Option<usize>,
+    reserved_width: usize,
+) -> usize {
+    if full_width {
+        terminal_columns
+            .map(|columns| columns.saturating_sub(reserved_width))
+            .unwrap_or(BAR_WIDTH)
+    } else {
+        BAR_WIDTH
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     sequence: usize,
@@ -599,6 +614,7 @@ mod tests {
                 date: false,
                 non_blank: false,
                 languages: false,
+                full_width: false,
                 commits: None,
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
@@ -624,6 +640,7 @@ mod tests {
                 date: true,
                 non_blank: true,
                 languages: false,
+                full_width: false,
                 commits: None,
                 revision: "main".to_owned(),
                 path: "/tmp/project".to_owned(),
@@ -639,6 +656,7 @@ mod tests {
                 date: false,
                 non_blank: false,
                 languages: false,
+                full_width: false,
                 commits: Some(CommitInterval::Monthly),
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
@@ -662,6 +680,7 @@ mod tests {
                 date: true,
                 non_blank: false,
                 languages: true,
+                full_width: false,
                 commits: None,
                 revision: "HEAD".to_owned(),
                 path: ".".to_owned(),
@@ -675,6 +694,24 @@ mod tests {
             parse_options(["--languages", "--commits", "daily"].map(str::to_owned)).unwrap_err(),
             "--languages cannot be combined with --commits or --non-blank"
         );
+    }
+
+    #[test]
+    fn parses_full_width_independently_of_chart_mode() {
+        let options =
+            parse_options(["--full-width", "--languages", "--date"].map(str::to_owned)).unwrap();
+
+        assert!(options.full_width);
+        assert!(options.languages);
+        assert!(options.date);
+    }
+
+    #[test]
+    fn chooses_full_terminal_width_only_when_requested_and_available() {
+        assert_eq!(choose_bar_width(false, Some(120), 30), BAR_WIDTH);
+        assert_eq!(choose_bar_width(true, Some(120), 30), 90);
+        assert_eq!(choose_bar_width(true, Some(20), 30), 0);
+        assert_eq!(choose_bar_width(true, None, 30), BAR_WIDTH);
     }
 
     #[test]
