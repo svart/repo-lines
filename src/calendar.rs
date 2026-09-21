@@ -160,8 +160,7 @@ fn weekday(year: i32, month: u8, day: u8) -> i32 {
         + year % 100
         + (year % 100) / 4
         + year / 100 / 4
-        + 5 * (year / 100)
-        + 5)
+        + 5 * (year / 100))
         % 7
 }
 
@@ -208,10 +207,18 @@ mod tests {
     }
 
     #[test]
-    fn steps_iso_weeks() {
+    fn steps_iso_weeks_including_long_years() {
         let next = |value| next_interval(value, CommitInterval::Weekly).unwrap();
 
         assert_eq!(next("2026-W01"), "2026-W02");
+        // 2026 starts on a Thursday, so it has 53 ISO weeks.
+        assert_eq!(iso_weeks_in_year(2026), 53);
+        assert_eq!(next("2026-W52"), "2026-W53");
+        assert_eq!(next("2026-W53"), "2027-W01");
+        // 2020 is a leap year starting on a Wednesday: also 53 weeks.
+        assert_eq!(iso_weeks_in_year(2020), 53);
+        // 2025 is an ordinary 52-week year.
+        assert_eq!(iso_weeks_in_year(2025), 52);
         assert_eq!(next("2025-W52"), "2026-W01");
     }
 
