@@ -1,6 +1,6 @@
 [package]
 name = "repo-lines"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Terminal charts of a Git repository's line count, language mix, and commit frequency over its first-parent history"
 repository = "https://github.com/svart/repo-lines"
