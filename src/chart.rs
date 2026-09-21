@@ -1,10 +1,12 @@
+//! Rendering. Every function here turns already-collected data into text and
+//! never queries the repository or reshapes the series it is given.
+
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::Snapshot;
-use crate::cli::CommitInterval;
 use crate::language::Language;
 use crate::language_history::LanguageSnapshot;
+use crate::line_history::Snapshot;
 
 const FRACTIONAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 const LANGUAGE_SYMBOLS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -13,132 +15,172 @@ const LANGUAGE_COLORS: [u8; 36] = [
     77, 204, 38, 172, 62, 210, 36, 180, 75, 168, 48, 202, 99, 114, 217, 51,
 ];
 
-pub fn render_chart(
-    history: &[Snapshot],
-    width: usize,
-    date: bool,
-    non_blank: bool,
-    colors: bool,
-) -> String {
+/// Both palettes are indexed modulo their length, so a language set larger than
+/// either one repeats entries instead of panicking. Keeping symbols at least as
+/// long as colors means plain-text output stays distinct wherever color does.
+const _: () = assert!(LANGUAGE_SYMBOLS.len() >= LANGUAGE_COLORS.len());
+
+/// The default bar width used when the terminal size is irrelevant or unknown.
+const DEFAULT_BARS: usize = 50;
+
+/// How much horizontal space the chart may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChartWidth {
+    /// Draw bars exactly this many columns wide.
+    Bars(usize),
+    /// Give bars whatever the terminal leaves after labels and values.
+    Terminal(usize),
+}
+
+impl ChartWidth {
+    pub(crate) const DEFAULT: Self = Self::Bars(DEFAULT_BARS);
+}
+
+/// Presentation flags shared by the snapshot-based charts. `non_blank` is
+/// meaningful only for the line chart; the CLI rejects it in other modes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ChartStyle {
+    pub(crate) date: bool,
+    pub(crate) non_blank: bool,
+    pub(crate) colors: bool,
+}
+
+/// Column budget for one chart: how wide the right-aligned label column is and
+/// how many columns are left for bars.
+struct Layout {
+    label: usize,
+    bar: usize,
+}
+
+impl Layout {
+    /// `value` is the width of the trailing numeric column, or `None` for
+    /// charts that print no value after the bar. A row is laid out as
+    /// `label`, two spaces, the bar, then a space and the value.
+    fn new(label: usize, value: Option<usize>, width: ChartWidth) -> Self {
+        let reserved = label + 2 + value.map_or(0, |value| value + 1);
+        let bar = match width {
+            ChartWidth::Bars(bars) => bars,
+            ChartWidth::Terminal(columns) => columns.saturating_sub(reserved),
+        };
+        Self { label, bar }
+    }
+}
+
+fn sequence_width(rows: usize) -> usize {
+    rows.max(1).to_string().len()
+}
+
+fn digits(value: u64) -> usize {
+    value.to_string().len()
+}
+
+pub(crate) fn render_chart(history: &[Snapshot], width: ChartWidth, style: ChartStyle) -> String {
+    let sequence_width = sequence_width(history.len());
+    let layout = Layout::new(
+        label_width(
+            history
+                .iter()
+                .map(|s| s.at.label(style.date, sequence_width)),
+        ),
+        Some(
+            history
+                .iter()
+                .map(|snapshot| digits(snapshot.lines.all))
+                .max()
+                .unwrap_or(1),
+        ),
+        width,
+    );
     let maximum = history
         .iter()
-        .map(|snapshot| snapshot.lines)
+        .map(|snapshot| snapshot.lines.all)
         .max()
         .unwrap_or(0);
-    let sequence_width = history.len().max(1).to_string().len();
-    let label_width = line_chart_label_width(history, date, sequence_width);
+
     let mut chart = String::from("        0 LoC\n");
     for snapshot in history {
-        let label = snapshot.label(date, sequence_width);
-        let bar = if non_blank {
+        let label = snapshot.at.label(style.date, sequence_width);
+        let bar = if style.non_blank {
             render_layered_bar(
-                snapshot.non_blank_lines,
-                snapshot.lines,
+                snapshot.lines.non_blank,
+                snapshot.lines.all,
                 maximum,
-                width,
-                colors,
+                layout.bar,
+                style.colors,
             )
         } else {
-            render_bar(snapshot.lines, maximum, width)
+            render_bar(snapshot.lines.all, maximum, layout.bar)
         };
-        let _ = writeln!(
-            chart,
-            "{label:>label_width$}  {bar}{}{}",
-            if bar.is_empty() { "" } else { " " },
-            snapshot.lines
-        );
+        write_row(&mut chart, &label, layout.label, &bar, snapshot.lines.all);
     }
     chart
 }
 
-pub fn line_chart_reserved_width(history: &[Snapshot], date: bool) -> usize {
-    let sequence_width = history.len().max(1).to_string().len();
-    let label_width = line_chart_label_width(history, date, sequence_width);
-    let value_width = history
-        .iter()
-        .map(|snapshot| snapshot.lines.to_string().len())
-        .max()
-        .unwrap_or(1);
-    label_width + 3 + value_width
-}
-
-fn line_chart_label_width(history: &[Snapshot], date: bool, sequence_width: usize) -> usize {
-    history
-        .iter()
-        .map(|snapshot| snapshot.label(date, sequence_width).len())
-        .max()
-        .unwrap_or(15)
-}
-
-pub fn render_commit_chart(
-    counts: &[(String, u64)],
-    interval: CommitInterval,
-    width: usize,
-) -> String {
-    let counts = fill_empty_intervals(counts, interval);
+pub(crate) fn render_commit_chart(counts: &[(String, u64)], width: ChartWidth) -> String {
+    let layout = Layout::new(
+        counts
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(0),
+        Some(
+            counts
+                .iter()
+                .map(|(_, count)| digits(*count))
+                .max()
+                .unwrap_or(1),
+        ),
+        width,
+    );
     let maximum = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
-    let label_width = commit_chart_label_width(&counts);
+
     let mut chart = String::from("    0 commits\n");
     for (label, count) in counts {
-        let bar = render_bar(count, maximum, width);
-        let _ = writeln!(
-            chart,
-            "{label:>label_width$}  {bar}{}{}",
-            if bar.is_empty() { "" } else { " " },
-            count
-        );
+        let bar = render_bar(*count, maximum, layout.bar);
+        write_row(&mut chart, label, layout.label, &bar, *count);
     }
     chart
 }
 
-pub fn commit_chart_reserved_width(counts: &[(String, u64)]) -> usize {
-    let label_width = commit_chart_label_width(counts);
-    let value_width = counts
-        .iter()
-        .map(|(_, count)| count.to_string().len())
-        .max()
-        .unwrap_or(1);
-    label_width + 3 + value_width
+/// Writes `label  bar value`, collapsing the separating space when the bar is
+/// empty so a zero row reads `label  0`.
+fn write_row(chart: &mut String, label: &str, label_width: usize, bar: &str, value: u64) {
+    let separator = if bar.is_empty() { "" } else { " " };
+    let _ = writeln!(chart, "{label:>label_width$}  {bar}{separator}{value}");
 }
 
-fn commit_chart_label_width(counts: &[(String, u64)]) -> usize {
-    counts
-        .iter()
-        .map(|(label, _)| label.len())
-        .max()
-        .unwrap_or(0)
-}
-
-pub fn render_language_chart(
+pub(crate) fn render_language_chart(
     history: &[LanguageSnapshot],
-    width: usize,
-    date: bool,
-    colors: bool,
+    width: ChartWidth,
+    style: ChartStyle,
 ) -> String {
-    let mut languages: Vec<Language> = history
-        .iter()
-        .flat_map(|snapshot| snapshot.lines.keys().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    languages.sort_by_key(|language| (*language == Language::Other, language.name()));
+    let languages = legend_order(history);
+    let sequence_width = sequence_width(history.len());
+    let layout = Layout::new(
+        label_width(
+            history
+                .iter()
+                .map(|s| s.at.label(style.date, sequence_width)),
+        ),
+        None,
+        width,
+    );
 
-    let sequence_width = history.len().max(1).to_string().len();
-    let label_width = language_chart_label_width(history, date, sequence_width);
+    let label_width = layout.label;
     let mut chart = format!(
         "{:>label_width$}  0%{:>marker_width$}\n",
         "",
         "100%",
-        marker_width = width.saturating_sub(2)
+        marker_width = layout.bar.saturating_sub(2)
     );
     for snapshot in history {
-        let label = snapshot.label(date, sequence_width);
-        let widths = language_widths(snapshot, &languages, width);
+        let label = snapshot.at.label(style.date, sequence_width);
+        let widths = language_widths(snapshot, &languages, layout.bar);
         if widths.iter().all(|segment| *segment == 0) {
             let _ = writeln!(chart, "{label:>label_width$}  0 lines");
             continue;
         }
-        let bar = render_language_bar(&widths, colors);
+        let bar = render_language_bar(&widths, style.colors);
         let _ = writeln!(chart, "{label:>label_width$}  {bar}");
     }
 
@@ -149,20 +191,10 @@ pub fn render_language_chart(
             if index != 0 {
                 chart.push_str(", ");
             }
-            if colors {
-                let _ = write!(
-                    chart,
-                    "\x1b[38;5;{}m█\x1b[0m {}",
-                    LANGUAGE_COLORS[index % LANGUAGE_COLORS.len()],
-                    language.name()
-                );
+            if style.colors {
+                let _ = write!(chart, "{} {}", color_block(index), language.name());
             } else {
-                let _ = write!(
-                    chart,
-                    "{} {}",
-                    char::from(LANGUAGE_SYMBOLS[index]),
-                    language.name()
-                );
+                let _ = write!(chart, "{} {}", symbol(index), language.name());
             }
         }
         chart.push('\n');
@@ -170,23 +202,40 @@ pub fn render_language_chart(
     chart
 }
 
-pub fn language_chart_reserved_width(history: &[LanguageSnapshot], date: bool) -> usize {
-    let sequence_width = history.len().max(1).to_string().len();
-    language_chart_label_width(history, date, sequence_width) + 2
-}
-
-fn language_chart_label_width(
-    history: &[LanguageSnapshot],
-    date: bool,
-    sequence_width: usize,
-) -> usize {
-    history
+/// Every language the history touches, alphabetically, with `Other` last so the
+/// catch-all does not sit between real languages.
+fn legend_order(history: &[LanguageSnapshot]) -> Vec<Language> {
+    let mut languages: Vec<Language> = history
         .iter()
-        .map(|snapshot| snapshot.label(date, sequence_width).len())
-        .max()
-        .unwrap_or(15)
+        .flat_map(|snapshot| snapshot.lines.keys().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    languages.sort_by_key(|language| (*language == Language::Other, language.name()));
+    languages
 }
 
+/// Falls back to a plausible width so an empty history still leaves room for a
+/// label column.
+fn label_width(labels: impl Iterator<Item = String>) -> usize {
+    labels.map(|label| label.len()).max().unwrap_or(15)
+}
+
+fn symbol(index: usize) -> char {
+    char::from(LANGUAGE_SYMBOLS[index % LANGUAGE_SYMBOLS.len()])
+}
+
+fn color(index: usize) -> u8 {
+    LANGUAGE_COLORS[index % LANGUAGE_COLORS.len()]
+}
+
+fn color_block(index: usize) -> String {
+    format!("\x1b[38;5;{}m█\x1b[0m", color(index))
+}
+
+/// Distributes `width` columns across `languages` in proportion to their line
+/// counts, handing the leftover columns to the largest remainders so the bar is
+/// always exactly `width` wide.
 fn language_widths(
     snapshot: &LanguageSnapshot,
     languages: &[Language],
@@ -227,14 +276,11 @@ fn render_language_bar(widths: &[usize], colors: bool) -> String {
             let _ = write!(
                 bar,
                 "\x1b[38;5;{}m{}\x1b[0m",
-                LANGUAGE_COLORS[index % LANGUAGE_COLORS.len()],
+                color(index),
                 "█".repeat(*width)
             );
         } else {
-            bar.extend(std::iter::repeat_n(
-                char::from(LANGUAGE_SYMBOLS[index]),
-                *width,
-            ));
+            bar.extend(std::iter::repeat_n(symbol(index), *width));
         }
     }
     bar
@@ -260,7 +306,10 @@ fn scaled_eighths(value: u64, maximum: u64, width: usize) -> u128 {
     (u128::from(value) * width as u128 * 8) / u128::from(maximum)
 }
 
-pub(crate) fn render_layered_bar(
+/// Draws the total-lines bar, then recolors its leading portion grey to show how
+/// much of it is non-blank. Splitting an already-drawn bar keeps the boundary
+/// continuous even when it lands inside a fractional block.
+fn render_layered_bar(
     non_blank: u64,
     all: u64,
     maximum: u64,
@@ -292,117 +341,187 @@ pub(crate) fn render_layered_bar(
     )
 }
 
-fn fill_empty_intervals(counts: &[(String, u64)], interval: CommitInterval) -> Vec<(String, u64)> {
-    let Some((first, _)) = counts.first() else {
-        return Vec::new();
-    };
-    let mut current = first.clone();
-    let last = &counts.last().expect("first exists").0;
-    let mut index = 0;
-    let mut result = Vec::new();
-    loop {
-        let count = if counts
-            .get(index)
-            .is_some_and(|(label, _)| label == &current)
-        {
-            let value = counts[index].1;
-            index += 1;
-            value
-        } else {
-            0
-        };
-        result.push((current.clone(), count));
-        if &current == last {
-            break;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commit::CommitRef;
+    use crate::line_count::LineCount;
+    use std::collections::BTreeMap;
+
+    fn snapshot(sequence: usize, id: &str, all: u64, non_blank: u64) -> Snapshot {
+        Snapshot {
+            at: CommitRef::new(sequence, id, "2026-07-15 10:00:00"),
+            lines: LineCount { all, non_blank },
         }
-        current = next_interval(&current, interval).expect("Git emitted a valid interval");
     }
-    result
-}
 
-fn next_interval(value: &str, interval: CommitInterval) -> Option<String> {
-    match interval {
-        CommitInterval::Daily => {
-            let (year, month, day) = parse_date(value)?;
-            let (year, month, day) = if day < days_in_month(year, month) {
-                (year, month, day + 1)
-            } else if month < 12 {
-                (year, month + 1, 1)
-            } else {
-                (year + 1, 1, 1)
-            };
-            Some(format!("{year:04}-{month:02}-{day:02}"))
+    fn language_snapshot(
+        sequence: usize,
+        id: &str,
+        lines: BTreeMap<Language, u64>,
+    ) -> LanguageSnapshot {
+        LanguageSnapshot {
+            at: CommitRef::new(sequence, id, "2026-07-15 10:00:00"),
+            lines,
         }
-        CommitInterval::Weekly => {
-            let (year, week) = value.split_once("-W")?;
-            let year = year.parse::<i32>().ok()?;
-            let week = week.parse::<u8>().ok()?;
-            if week < iso_weeks_in_year(year) {
-                Some(format!("{year:04}-W{:02}", week + 1))
-            } else {
-                Some(format!("{:04}-W01", year + 1))
-            }
-        }
-        CommitInterval::Monthly => {
-            let (year, month) = value.split_once('-')?;
-            let year = year.parse::<i32>().ok()?;
-            let month = month.parse::<u8>().ok()?;
-            if month < 12 {
-                Some(format!("{year:04}-{:02}", month + 1))
-            } else {
-                Some(format!("{:04}-01", year + 1))
-            }
-        }
-        CommitInterval::Yearly => Some(format!("{:04}", value.parse::<i32>().ok()? + 1)),
     }
-}
 
-fn parse_date(value: &str) -> Option<(i32, u8, u8)> {
-    let mut parts = value.split('-');
-    let year = parts.next()?.parse().ok()?;
-    let month = parts.next()?.parse().ok()?;
-    let day = parts.next()?.parse().ok()?;
-    (parts.next().is_none()
-        && (1..=12).contains(&month)
-        && (1..=days_in_month(year, month)).contains(&day))
-    .then_some((year, month, day))
-}
-
-fn days_in_month(year: i32, month: u8) -> u8 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
+    #[test]
+    fn layout_splits_terminal_columns_between_labels_values_and_bars() {
+        // 12 label + 2 gutter + 1 space + 2 value = 17 reserved of 120.
+        assert_eq!(Layout::new(12, Some(2), ChartWidth::Terminal(120)).bar, 103);
+        // Without a value column only the two-space gutter is reserved.
+        assert_eq!(Layout::new(10, None, ChartWidth::Terminal(120)).bar, 108);
+        // A fixed width ignores the terminal entirely.
+        assert_eq!(Layout::new(12, Some(2), ChartWidth::Bars(50)).bar, 50);
+        // A terminal narrower than the reserved columns yields no bar.
+        assert_eq!(Layout::new(12, Some(2), ChartWidth::Terminal(10)).bar, 0);
     }
-}
 
-fn is_leap_year(year: i32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
+    #[test]
+    fn renders_scaled_bars_in_history_order() {
+        let history = vec![
+            snapshot(1, "0123456789abcdef", 5, 4),
+            snapshot(2, "fedcba9876543210", 10, 8),
+            snapshot(3, "aabbccddeeff0011", 0, 0),
+        ];
 
-fn iso_weeks_in_year(year: i32) -> u8 {
-    let jan_first = weekday(year, 1, 1);
-    if jan_first == 5 || (jan_first == 4 && is_leap_year(year)) {
-        53
-    } else {
-        52
+        assert_eq!(
+            render_chart(&history, ChartWidth::Bars(10), ChartStyle::default()),
+            "        0 LoC\n\
+             1:01234567  █████ 5\n\
+             2:fedcba98  ██████████ 10\n\
+             3:aabbccdd  0\n"
+        );
+
+        assert_eq!(
+            render_chart(
+                &history,
+                ChartWidth::Bars(10),
+                ChartStyle {
+                    date: true,
+                    ..ChartStyle::default()
+                },
+            ),
+            "        0 LoC\n\
+             2026-07-15 10:00:00:1:01234567  █████ 5\n\
+             2026-07-15 10:00:00:2:fedcba98  ██████████ 10\n\
+             2026-07-15 10:00:00:3:aabbccdd  0\n"
+        );
     }
-}
 
-fn weekday(year: i32, month: u8, day: u8) -> i32 {
-    let (year, month) = if month < 3 {
-        (year - 1, month as i32 + 12)
-    } else {
-        (year, month as i32)
-    };
-    (day as i32
-        + (13 * (month + 1)) / 5
-        + year % 100
-        + (year % 100) / 4
-        + year / 100 / 4
-        + 5 * (year / 100)
-        + 5)
-        % 7
+    #[test]
+    fn leaves_the_default_chart_uncolored() {
+        let history = vec![snapshot(1, "0123456789abcdef", 10, 5)];
+
+        assert_eq!(
+            render_chart(
+                &history,
+                ChartWidth::Bars(10),
+                ChartStyle {
+                    colors: true,
+                    ..ChartStyle::default()
+                },
+            ),
+            "        0 LoC\n1:01234567  ██████████ 10\n"
+        );
+    }
+
+    #[test]
+    fn layers_grey_non_blank_lines_over_the_white_total() {
+        assert_eq!(
+            render_layered_bar(5, 10, 10, 10, true),
+            "\x1b[90m█████\x1b[97m█████\x1b[0m"
+        );
+        assert_eq!(render_layered_bar(5, 10, 10, 10, false), "██████████");
+    }
+
+    #[test]
+    fn keeps_fractional_bars_continuous_at_the_color_boundary() {
+        assert_eq!(
+            render_layered_bar(73, 89, 100, 10, true),
+            "\x1b[90m███████\x1b[97m█▉\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn renders_daily_commit_counts() {
+        let commits = vec![
+            ("2026-07-14".to_owned(), 2),
+            ("2026-07-15".to_owned(), 0),
+            ("2026-07-16".to_owned(), 1),
+        ];
+
+        assert_eq!(
+            render_commit_chart(&commits, ChartWidth::Bars(10)),
+            "    0 commits\n\
+             2026-07-14  ██████████ 2\n\
+             2026-07-15  0\n\
+             2026-07-16  █████ 1\n"
+        );
+    }
+
+    #[test]
+    fn renders_language_fractions_with_stable_plain_text_symbols() {
+        let history = vec![
+            language_snapshot(
+                1,
+                "0123456789abcdef",
+                BTreeMap::from([(Language::Rust, 3), (Language::Markdown, 1)]),
+            ),
+            language_snapshot(
+                2,
+                "fedcba9876543210",
+                BTreeMap::from([(Language::Rust, 2), (Language::Python, 2)]),
+            ),
+        ];
+
+        let chart = render_language_chart(&history, ChartWidth::Bars(10), ChartStyle::default());
+
+        assert!(chart.contains("1:01234567  AAACCCCCCC\n"));
+        assert!(chart.contains("2:fedcba98  BBBBBCCCCC\n"));
+        assert!(chart.ends_with("Legend: A Markdown, B Python, C Rust\n"));
+    }
+
+    #[test]
+    fn language_fraction_rounding_always_fills_the_bar() {
+        let history = vec![language_snapshot(
+            1,
+            "0123456789abcdef",
+            BTreeMap::from([
+                (Language::Rust, 1),
+                (Language::Python, 1),
+                (Language::Markdown, 1),
+            ]),
+        )];
+
+        let chart = render_language_chart(&history, ChartWidth::Bars(10), ChartStyle::default());
+        let bar = chart
+            .lines()
+            .find(|line| line.contains("1:01234567"))
+            .and_then(|line| line.rsplit_once("  ").map(|(_, bar)| bar))
+            .unwrap();
+
+        assert_eq!(bar.chars().count(), 10);
+    }
+
+    #[test]
+    fn language_palettes_wrap_instead_of_panicking() {
+        assert_eq!(color(LANGUAGE_COLORS.len() + 3), color(3));
+        assert_eq!(symbol(LANGUAGE_SYMBOLS.len() + 3), symbol(3));
+        // Symbols outlast colors, so plain-text output stays distinct longer.
+        assert_ne!(symbol(LANGUAGE_COLORS.len() + 3), symbol(3));
+    }
+
+    #[test]
+    fn empty_histories_render_only_a_header() {
+        assert_eq!(
+            render_chart(&[], ChartWidth::Bars(10), ChartStyle::default()),
+            "        0 LoC\n"
+        );
+        assert_eq!(
+            render_commit_chart(&[], ChartWidth::Bars(10)),
+            "    0 commits\n"
+        );
+    }
 }

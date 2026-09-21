@@ -1,54 +1,94 @@
+//! Per-language line history along a revision's first-parent path.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::language::{Language, classify_path};
-use crate::{
-    BlobReader, diff_history, git, git_failure, mode_has_blob, uses_external_attributes,
-    uses_versioned_attributes,
+use crate::commit::CommitRef;
+use crate::git::{
+    BlobReader, diff_history, first_parent_log, grep, mode_has_blob, needs_attribute_aware_count,
 };
+use crate::language::{Language, classify_path};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LanguageSnapshot {
-    sequence: usize,
-    commit: String,
-    datetime: String,
+    pub(crate) at: CommitRef,
     pub(crate) lines: BTreeMap<Language, u64>,
 }
 
-impl LanguageSnapshot {
-    pub(crate) fn new(
-        sequence: usize,
-        commit: &str,
-        datetime: &str,
-        lines: BTreeMap<Language, u64>,
-    ) -> Self {
-        Self {
-            sequence,
-            commit: commit.to_owned(),
-            datetime: datetime.to_owned(),
-            lines,
-        }
+/// Walks the first-parent history oldest to newest, keeping a running per-language
+/// total. Mirrors `line_history::collect_history`, including its `git grep`
+/// fallback for attribute-sensitive repositories.
+pub(crate) fn collect_language_history(
+    repo: &Path,
+    revision: &str,
+) -> Result<Vec<LanguageSnapshot>, String> {
+    let commits = first_parent_log(repo, revision)?;
+    let commit_ids: Vec<&str> = commits.iter().map(|commit| commit.id.as_str()).collect();
+    let changes = diff_history(repo, &commit_ids)?;
+    drop(commit_ids);
+    if needs_attribute_aware_count(repo, &changes)? {
+        return collect_with_grep(repo, commits);
     }
 
-    pub(crate) fn label(&self, date: bool, sequence_width: usize) -> String {
-        let short_hash = self.commit.get(..8).unwrap_or(&self.commit);
-        if date {
-            format!(
-                "{}:{:0sequence_width$}:{short_hash}",
-                self.datetime, self.sequence
-            )
-        } else {
-            format!("{:0sequence_width$}:{short_hash}", self.sequence)
+    let mut blobs = BlobReader::open(repo, false)?;
+    let mut totals: BTreeMap<Language, u64> = BTreeMap::new();
+    let mut history = Vec::with_capacity(commits.len());
+    for (at, changes) in commits.into_iter().zip(changes) {
+        for change in changes {
+            let language = classify_path(&change.path);
+            if mode_has_blob(&change.old_mode) {
+                let removed = blobs.line_count(&change.old_oid)?.all;
+                let total = totals.entry(language).or_insert(0);
+                *total = total.checked_sub(removed).ok_or_else(|| {
+                    format!(
+                        "{} line count underflow while removing {}",
+                        language.name(),
+                        change.old_oid
+                    )
+                })?;
+                if *total == 0 {
+                    totals.remove(&language);
+                }
+            }
+            if mode_has_blob(&change.new_mode) {
+                let added = blobs.line_count(&change.new_oid)?.all;
+                let total = totals.entry(language).or_insert(0);
+                *total = total.checked_add(added).ok_or_else(|| {
+                    format!(
+                        "{} line count overflow while adding {}",
+                        language.name(),
+                        change.new_oid
+                    )
+                })?;
+            }
         }
+        history.push(LanguageSnapshot {
+            at,
+            lines: totals.clone(),
+        });
     }
+    blobs.finish()?;
+    Ok(history)
 }
 
+fn collect_with_grep(
+    repo: &Path,
+    commits: Vec<CommitRef>,
+) -> Result<Vec<LanguageSnapshot>, String> {
+    commits
+        .into_iter()
+        .map(|at| {
+            let lines = grep_language_counts(repo, &at.id)?;
+            Ok(LanguageSnapshot { at, lines })
+        })
+        .collect()
+}
+
+/// Counts lines per language at one commit with `git grep -z`, whose records
+/// are `<commit>:<path>\0<count>\n`.
 fn grep_language_counts(repo: &Path, commit: &str) -> Result<BTreeMap<Language, u64>, String> {
     let args = ["grep", "-I", "-c", "-z", "^", commit, "--"];
-    let output = git(repo, &args)?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(git_failure(&args, &output));
-    }
+    let output = grep(repo, &args)?;
 
     let mut totals = BTreeMap::new();
     let mut cursor = 0;
@@ -82,95 +122,43 @@ fn grep_language_counts(repo: &Path, commit: &str) -> Result<BTreeMap<Language, 
     Ok(totals)
 }
 
-fn collect_with_grep(
-    repo: &Path,
-    commits: &[(String, String)],
-) -> Result<Vec<LanguageSnapshot>, String> {
-    commits
-        .iter()
-        .enumerate()
-        .map(|(index, (commit, datetime))| {
-            Ok(LanguageSnapshot::new(
-                index + 1,
-                commit,
-                datetime,
-                grep_language_counts(repo, commit)?,
-            ))
-        })
-        .collect()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_repo::TempRepo;
 
-pub(crate) fn collect_language_history(
-    repo: &Path,
-    revision: &str,
-) -> Result<Vec<LanguageSnapshot>, String> {
-    let log_args = [
-        "log",
-        "--format=%H%x09%cd",
-        "--date=format:%Y-%m-%d %H:%M:%S",
-        "--reverse",
-        "--first-parent",
-        revision,
-    ];
-    let log = git(repo, &log_args)?;
-    if !log.status.success() {
-        return Err(git_failure(&log_args, &log));
-    }
-    let commit_output = std::str::from_utf8(&log.stdout)
-        .map_err(|error| format!("git log returned non-UTF-8 output: {error}"))?;
-    let commits: Vec<(String, String)> = commit_output
-        .lines()
-        .map(|line| {
-            line.split_once('\t')
-                .map(|(commit, datetime)| (commit.to_owned(), datetime.to_owned()))
-                .ok_or_else(|| format!("malformed git log output: {line}"))
-        })
-        .collect::<Result<_, _>>()?;
-    let commit_ids: Vec<&str> = commits.iter().map(|(commit, _)| commit.as_str()).collect();
-    let changes = diff_history(repo, &commit_ids)?;
-    if uses_versioned_attributes(&changes) || uses_external_attributes(repo, &changes)? {
-        return collect_with_grep(repo, &commits);
+    #[test]
+    fn collects_language_fractions_across_file_changes() {
+        let repo = TempRepo::new();
+        repo.write("main.rs", b"one\ntwo\n");
+        repo.write("README.md", b"intro\n");
+        repo.commit("add rust and markdown");
+        repo.write("main.rs", b"one\ntwo\nthree\nfour\n");
+        repo.run(&["mv", "README.md", "notes.py"]);
+        repo.commit("grow rust and reclassify markdown");
+
+        let snapshots = collect_language_history(repo.path(), "HEAD").unwrap();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].lines.get(&Language::Rust), Some(&2));
+        assert_eq!(snapshots[0].lines.get(&Language::Markdown), Some(&1));
+        assert_eq!(snapshots[1].lines.get(&Language::Rust), Some(&4));
+        assert_eq!(snapshots[1].lines.get(&Language::Python), Some(&1));
+        assert_eq!(snapshots[1].lines.get(&Language::Markdown), None);
     }
 
-    let mut blobs = BlobReader::open(repo, false)?;
-    let mut totals = BTreeMap::new();
-    let mut history = Vec::with_capacity(commits.len());
-    for (index, ((commit, datetime), changes)) in commits.iter().zip(changes).enumerate() {
-        for change in changes {
-            let language = classify_path(&change.path);
-            if mode_has_blob(&change.old_mode) {
-                let removed = blobs.line_count(&change.old_oid)?.all;
-                let total = totals.entry(language).or_insert(0_u64);
-                *total = total.checked_sub(removed).ok_or_else(|| {
-                    format!(
-                        "{} line count underflow while removing {}",
-                        language.name(),
-                        change.old_oid
-                    )
-                })?;
-                if *total == 0 {
-                    totals.remove(&language);
-                }
-            }
-            if mode_has_blob(&change.new_mode) {
-                let added = blobs.line_count(&change.new_oid)?.all;
-                let total = totals.entry(language).or_insert(0_u64);
-                *total = total.checked_add(added).ok_or_else(|| {
-                    format!(
-                        "{} line count overflow while adding {}",
-                        language.name(),
-                        change.new_oid
-                    )
-                })?;
-            }
-        }
-        history.push(LanguageSnapshot::new(
-            index + 1,
-            commit,
-            datetime,
-            totals.clone(),
-        ));
+    #[test]
+    fn honors_historical_attribute_overrides() {
+        let repo = TempRepo::new();
+        repo.write(".gitattributes", b"*.rs -diff\n*.data diff\n");
+        repo.write("ignored.rs", b"one\ntwo\n");
+        repo.write("included.data", b"three\0four\n");
+        repo.commit("add attribute overrides");
+
+        let snapshots = collect_language_history(repo.path(), "HEAD").unwrap();
+
+        assert_eq!(snapshots[0].lines.get(&Language::Rust), None);
+        assert_eq!(snapshots[0].lines.get(&Language::Other), Some(&3));
+        assert_eq!(snapshots[0].lines.values().sum::<u64>(), 3);
     }
-    blobs.finish()?;
-    Ok(history)
 }
