@@ -1,7 +1,9 @@
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Language {
+    ArkTs,
     C,
     Cpp,
+    CMake,
     CSharp,
     Css,
     Dart,
@@ -13,6 +15,7 @@ pub(crate) enum Language {
     Java,
     JavaScript,
     Json,
+    Json5,
     Julia,
     Kotlin,
     Lua,
@@ -41,8 +44,10 @@ pub(crate) enum Language {
 impl Language {
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::ArkTs => "ArkTS",
             Self::C => "C",
             Self::Cpp => "C++",
+            Self::CMake => "CMake",
             Self::CSharp => "C#",
             Self::Css => "CSS",
             Self::Dart => "Dart",
@@ -54,6 +59,7 @@ impl Language {
             Self::Java => "Java",
             Self::JavaScript => "JavaScript",
             Self::Json => "JSON",
+            Self::Json5 => "JSON5",
             Self::Julia => "Julia",
             Self::Kotlin => "Kotlin",
             Self::Lua => "Lua",
@@ -86,6 +92,7 @@ pub(crate) fn classify_path(path: &[u8]) -> Language {
     let lowercase: Vec<u8> = filename.iter().map(u8::to_ascii_lowercase).collect();
 
     match lowercase.as_slice() {
+        b"cmakelists.txt" => return Language::CMake,
         b"dockerfile" | b"containerfile" => return Language::Dockerfile,
         b"makefile" | b"gnumakefile" => return Language::Makefile,
         _ => {}
@@ -96,8 +103,10 @@ pub(crate) fn classify_path(path: &[u8]) -> Language {
     };
     let extension = &lowercase[dot + 1..];
     match extension {
+        b"ets" => Language::ArkTs,
         b"c" | b"h" => Language::C,
         b"cc" | b"cpp" | b"cxx" | b"hh" | b"hpp" | b"hxx" => Language::Cpp,
+        b"cmake" => Language::CMake,
         b"cs" => Language::CSharp,
         b"css" | b"scss" | b"sass" | b"less" => Language::Css,
         b"dart" => Language::Dart,
@@ -108,6 +117,7 @@ pub(crate) fn classify_path(path: &[u8]) -> Language {
         b"java" => Language::Java,
         b"js" | b"jsx" | b"mjs" | b"cjs" => Language::JavaScript,
         b"json" => Language::Json,
+        b"json5" => Language::Json5,
         b"jl" => Language::Julia,
         b"kt" | b"kts" => Language::Kotlin,
         b"lua" => Language::Lua,
@@ -144,12 +154,17 @@ mod tests {
         assert_eq!(classify_path(b"include/value.hpp").name(), "C++");
         assert_eq!(classify_path(b"script.py").name(), "Python");
         assert_eq!(classify_path(b"README.md").name(), "Markdown");
+        assert_eq!(classify_path(b"entry/src/main/ets/pages/Index.ets").name(), "ArkTS");
+        assert_eq!(classify_path(b"entry/src/main/module.json5").name(), "JSON5");
+        assert_eq!(classify_path(b"cmake/Toolchain.cmake").name(), "CMake");
     }
 
     #[test]
     fn classifies_special_filenames_and_unknown_text_as_other() {
         assert_eq!(classify_path(b"containers/Dockerfile").name(), "Dockerfile");
         assert_eq!(classify_path(b"Makefile").name(), "Makefile");
+        assert_eq!(classify_path(b"src/cpp/CMakeLists.txt").name(), "CMake");
+        assert_eq!(classify_path(b"obfuscation-rules.txt").name(), "Other");
         assert_eq!(classify_path(b"LICENSE").name(), "Other");
         assert_eq!(classify_path(b"notes.unknown").name(), "Other");
     }
