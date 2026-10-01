@@ -154,7 +154,6 @@ pub(crate) fn render_language_chart(
     width: ChartWidth,
     style: ChartStyle,
 ) -> String {
-    let languages = legend_order(history);
     let sequence_width = sequence_width(history.len());
     let layout = Layout::new(
         label_width(
@@ -166,6 +165,8 @@ pub(crate) fn render_language_chart(
         width,
     );
 
+    let (languages, rows) = visible_language_widths(history, layout.bar);
+
     let label_width = layout.label;
     let mut chart = format!(
         "{:>label_width$}  0%{:>marker_width$}\n",
@@ -173,9 +174,8 @@ pub(crate) fn render_language_chart(
         "100%",
         marker_width = layout.bar.saturating_sub(2)
     );
-    for snapshot in history {
+    for (snapshot, widths) in history.iter().zip(rows) {
         let label = snapshot.at.label(style.date, sequence_width);
-        let widths = language_widths(snapshot, &languages, layout.bar);
         if widths.iter().all(|segment| *segment == 0) {
             let _ = writeln!(chart, "{label:>label_width$}  0 lines");
             continue;
@@ -200,6 +200,30 @@ pub(crate) fn render_language_chart(
         chart.push('\n');
     }
     chart
+}
+
+/// Per-row segment widths restricted to languages that get at least one column
+/// in some row, so the legend lists exactly what the bars draw. Widths are
+/// allocated against every language first, so dropping invisible ones does not
+/// change the rounding of the rest.
+fn visible_language_widths(
+    history: &[LanguageSnapshot],
+    width: usize,
+) -> (Vec<Language>, Vec<Vec<usize>>) {
+    let languages = legend_order(history);
+    let rows: Vec<Vec<usize>> = history
+        .iter()
+        .map(|snapshot| language_widths(snapshot, &languages, width))
+        .collect();
+    let visible: Vec<usize> = (0..languages.len())
+        .filter(|index| rows.iter().any(|row| row[*index] != 0))
+        .collect();
+    (
+        visible.iter().map(|index| languages[*index]).collect(),
+        rows.iter()
+            .map(|row| visible.iter().map(|index| row[*index]).collect())
+            .collect(),
+    )
 }
 
 /// Every language the history touches, alphabetically, with `Other` last so the
@@ -481,6 +505,33 @@ mod tests {
         assert!(chart.contains("1:01234567  AAACCCCCCC\n"));
         assert!(chart.contains("2:fedcba98  BBBBBCCCCC\n"));
         assert!(chart.ends_with("Legend: A Markdown, B Python, C Rust\n"));
+    }
+
+    #[test]
+    fn legend_lists_only_languages_that_get_a_column_in_some_revision() {
+        let history = vec![
+            language_snapshot(
+                1,
+                "0123456789abcdef",
+                BTreeMap::from([(Language::Rust, 100), (Language::Python, 1)]),
+            ),
+            language_snapshot(
+                2,
+                "fedcba9876543210",
+                BTreeMap::from([
+                    (Language::Rust, 90),
+                    (Language::Markdown, 10),
+                    (Language::Python, 1),
+                ]),
+            ),
+        ];
+
+        let chart = render_language_chart(&history, ChartWidth::Bars(10), ChartStyle::default());
+
+        // Python never earns a column; Markdown earns one only in revision 2.
+        assert!(chart.contains("1:01234567  BBBBBBBBBB\n"));
+        assert!(chart.contains("2:fedcba98  ABBBBBBBBB\n"));
+        assert!(chart.ends_with("Legend: A Markdown, B Rust\n"));
     }
 
     #[test]
